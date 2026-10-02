@@ -1,0 +1,65 @@
+# Cost-bounded paired navigation pilot. This deliberately does not replace
+# the planned 30-seed x 50-cycle study; it tests the causal chain at low N.
+# Run: .venv/bin/python -m astrocites.run_scheduler configs/experiments/input_semantics_pilot.yaml
+max_parallel: 3
+schedule: interleaved
+experiments:
+  - name: pilot_legacy_static_positive
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_regression/pilot_logs_legacy
+      experiment.num_experiments: 5
+      experiment.num_cycles: 5
+      experiment.seeds: [42, 223, 1337, 7, 19]
+      simulation.intensity: 15.0
+      simulation.input_mode: legacy_static_positive
+      simulation.input_probability: null
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_regression/pilot_legacy
+      diagnostics.evaluation_rollouts: 5
+      diagnostics.evaluation_checkpoints: [5]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    max_parallel: 1
+
+  - name: pilot_bernoulli_p0015_refrac40
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_regression/pilot_logs_p0015
+      experiment.num_experiments: 5
+      experiment.num_cycles: 5
+      experiment.seeds: [42, 223, 1337, 7, 19]
+      simulation.intensity: 15.0
+      simulation.input_mode: bernoulli
+      simulation.input_probability: 0.015
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_regression/pilot_p0015
+      diagnostics.evaluation_rollouts: 5
+      diagnostics.evaluation_checkpoints: [5]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    max_parallel: 1
+
+  - name: pilot_bernoulli_p015_refrac40
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_regression/pilot_logs_p015
+      experiment.num_experiments: 5
+      experiment.num_cycles: 5
+      experiment.seeds: [42, 223, 1337, 7, 19]
+      simulation.intensity: 15.0
+      simulation.input_mode: bernoulli
+      simulation.input_probability: 0.15
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_regression/pilot_p015
+      diagnostics.evaluation_rollouts: 5
+      diagnostics.evaluation_checkpoints: [5]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    max_parallel: 1

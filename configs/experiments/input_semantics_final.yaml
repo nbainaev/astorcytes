@@ -1,0 +1,68 @@
+# Paired final input-semantics regression study. Each seed is a separate
+# config-driven process so the scheduler can use four workers without sharing
+# RNG state. The 5-seed/50-cycle study is not a hyperparameter search.
+max_parallel: 4
+schedule: interleaved
+experiments:
+  - name: final_legacy_static_positive
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_final/logs_legacy
+      experiment.num_experiments: 1
+      experiment.num_cycles: 50
+      simulation.intensity: 15.0
+      simulation.input_mode: legacy_static_positive
+      simulation.input_probability: null
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_final/pilot_legacy
+      diagnostics.evaluation_rollouts: 20
+      diagnostics.evaluation_checkpoints: [50]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    grid:
+      experiment.seeds: [[42], [223], [1337], [7], [19]]
+    max_parallel: 5
+
+  - name: final_bernoulli_p0015_refrac40
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_final/logs_p0015
+      experiment.num_experiments: 1
+      experiment.num_cycles: 50
+      simulation.intensity: 15.0
+      simulation.input_mode: bernoulli
+      simulation.input_probability: 0.015
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_final/pilot_p0015
+      diagnostics.evaluation_rollouts: 20
+      diagnostics.evaluation_checkpoints: [50]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    grid:
+      experiment.seeds: [[42], [223], [1337], [7], [19]]
+    max_parallel: 5
+
+  - name: final_bernoulli_p015_refrac40
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_final/logs_p015
+      experiment.num_experiments: 1
+      experiment.num_cycles: 50
+      simulation.intensity: 15.0
+      simulation.input_mode: bernoulli
+      simulation.input_probability: 0.15
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_final/pilot_p015
+      diagnostics.evaluation_rollouts: 20
+      diagnostics.evaluation_checkpoints: [50]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    grid:
+      experiment.seeds: [[42], [223], [1337], [7], [19]]
+    max_parallel: 5

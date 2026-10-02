@@ -20,6 +20,9 @@ astrocyte:
   alpha: 0.001
   k: 0.2
 
+learning:
+  enable_stdp: true
+
 simulation:
   # Expected Bernoulli candidate events per 1-s window; with dt=1 ms this is p=0.15.
   intensity: 150.0
@@ -32,6 +35,8 @@ experiment:
 
 output_dir: "results_no_astro"
 logger_type: "file"
+runtime:
+  torch_num_threads: 1
 comet:
   workspace: null
   project_name: null

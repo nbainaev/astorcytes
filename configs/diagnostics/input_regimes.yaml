@@ -1,0 +1,33 @@
+# Controlled, no-learning input-path experiment. The base network/environment
+# settings come from configs/default.yaml; only input drive semantics vary.
+base_config: configs/default.yaml
+# Keep the historical intensity reference fixed even if the paper-faithful
+# production default is later corrected from 15 to 150 candidate events/s.
+intensity: 15.0
+repetitions: 100
+current_repetitions: 10
+seed: 20261001
+temperature: 1.0
+surrogate_kind: lif
+output_dir: results/input_diagnostics
+input_regimes:
+  - name: legacy_static_positive_refrac40
+    mode: legacy
+    probability: null
+    input_refractory: 40
+  - name: bernoulli_p0015_refrac40
+    mode: bernoulli
+    probability: 0.015
+    input_refractory: 40
+  - name: bernoulli_p0015_no_refrac
+    mode: bernoulli
+    probability: 0.015
+    input_refractory: 0
+  - name: bernoulli_p015_no_refrac_external_counterfactual
+    mode: bernoulli
+    probability: 0.15
+    input_refractory: 0
+  - name: bernoulli_p015_refrac40_source_paper
+    mode: bernoulli
+    probability: 0.15
+    input_refractory: 40

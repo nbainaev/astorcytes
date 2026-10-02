@@ -1,0 +1,64 @@
+# Paired, same-algorithm comparison of the three relevant input semantics.
+# Run with: .venv/bin/python -m astrocites.run_scheduler configs/experiments/input_semantics_regression.yaml
+max_parallel: 3
+schedule: interleaved
+experiments:
+  - name: legacy_static_positive_input
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_regression/logs_legacy
+      experiment.num_experiments: 30
+      experiment.num_cycles: 50
+      experiment.seeds: [42, 223, 1337, 7, 19, 31, 47, 59, 71, 83, 97, 109, 127, 149, 163, 181, 199, 211, 229, 251, 269, 283, 307, 331, 349, 367, 383, 401, 419, 439]
+      simulation.intensity: 15.0
+      simulation.input_mode: legacy_static_positive
+      simulation.input_probability: null
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_regression/raw_legacy
+      diagnostics.evaluation_rollouts: 20
+      diagnostics.evaluation_checkpoints: [50]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    max_parallel: 1
+
+  - name: bernoulli_p0015_refrac40
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_regression/logs_p0015
+      experiment.num_experiments: 30
+      experiment.num_cycles: 50
+      experiment.seeds: [42, 223, 1337, 7, 19, 31, 47, 59, 71, 83, 97, 109, 127, 149, 163, 181, 199, 211, 229, 251, 269, 283, 307, 331, 349, 367, 383, 401, 419, 439]
+      simulation.intensity: 15.0
+      simulation.input_mode: bernoulli
+      simulation.input_probability: 0.015
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_regression/raw_p0015
+      diagnostics.evaluation_rollouts: 20
+      diagnostics.evaluation_checkpoints: [50]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    max_parallel: 1
+
+  - name: bernoulli_p015_refrac40_source
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/default.yaml
+    overrides:
+      logger: file
+      output_dir: results/input_semantics_regression/logs_p015
+      experiment.num_experiments: 30
+      experiment.num_cycles: 50
+      experiment.seeds: [42, 223, 1337, 7, 19, 31, 47, 59, 71, 83, 97, 109, 127, 149, 163, 181, 199, 211, 229, 251, 269, 283, 307, 331, 349, 367, 383, 401, 419, 439]
+      simulation.intensity: 15.0
+      simulation.input_mode: bernoulli
+      simulation.input_probability: 0.15
+      simulation.input_refractory: 40
+      diagnostics.enable: true
+      diagnostics.output_dir: results/input_semantics_regression/raw_p015
+      diagnostics.evaluation_rollouts: 20
+      diagnostics.evaluation_checkpoints: [50]
+      diagnostics.evaluation_astrocyte_modes: [false, true]
+    max_parallel: 1

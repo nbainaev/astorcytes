@@ -1,0 +1,69 @@
+experiment_name: main_reference_source_reproduction
+
+grid_size: 3
+start_position: 4
+goal_position: 6
+n_steps: 101
+
+neuron:
+  learning_rate: 1.0
+  wmin: 0.001
+  wmax: 1.0
+  weight_decay: 0.0
+  post_spike_weight_decay: 0.005
+  reset: 0
+  refrac: 40
+  thresh: 7
+
+astrocyte:
+  enable: true
+  alpha: 0.001
+  k: 0.2
+
+reinforce:
+  enable: false
+  learning_rate: 0.01
+  temperature: 1.0
+  reward_goal: 10.0
+  step_penalty: -0.1
+  gamma: 0.99
+  baseline_decay: 0.01
+  policy_mix_beta: 0.0
+  trace_decay: 0.95
+  surrogate:
+    type: lif
+
+simulation:
+  intensity: 15.0
+  input_mode: legacy_static_positive
+  input_probability: null
+  input_refractory: 40
+  time_steps: 1000
+  dt: 1
+
+learning:
+  baseline_mode: main_reference
+  enable_stdp: true
+  main_selected_action_stdp_gain: 1.5
+
+protocol:
+  initial_baseline_stdp: true
+  legacy_verification_stdp: true
+  run_legacy_verification: true
+
+experiment:
+  num_experiments: 1
+  seeds: [1000]
+  num_cycles: 20
+
+diagnostics:
+  enable: true
+  output_dir: results/baseline_fidelity_audit/diagnostics_main_reference
+  evaluation_rollouts: 0
+  evaluation_checkpoints: [20]
+  evaluation_astrocyte_modes: [false, true]
+
+output_dir: results/baseline_fidelity_audit/main_reference
+logger_type: file
+runtime:
+  torch_num_threads: 1

@@ -1,0 +1,50 @@
+# Paired 8-seed source-fidelity comparison.
+# Both arms use notebook conditions; only port-specific semantics differ.
+max_parallel: 32
+schedule: interleaved
+experiments:
+  - name: main_notebook_semantics
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/diagnostics/main_reference.yaml
+    logger: file
+    output_dir: results/baseline_fidelity_audit/main_notebook_semantics
+    overrides:
+      learning.baseline_mode: main_reference
+      learning.main_selected_action_stdp_gain: 1.5
+      diagnostics.output_dir: results/baseline_fidelity_audit/diagnostics_main_reference
+      experiment.num_experiments: 1
+      experiment.num_cycles: 20
+    grid:
+      experiment.seeds:
+      - [1000]
+      - [1001]
+      - [1002]
+      - [1003]
+      - [1004]
+      - [1005]
+      - [1006]
+      - [1007]
+    max_parallel: 16
+
+  - name: plausible_adaptation_semantics
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/diagnostics/main_reference.yaml
+    logger: file
+    output_dir: results/baseline_fidelity_audit/plausible_adaptation
+    overrides:
+      learning.baseline_mode: plausible
+      learning.main_selected_action_stdp_gain: 1.0
+      diagnostics.output_dir: results/baseline_fidelity_audit/diagnostics_plausible
+      experiment.num_experiments: 1
+      experiment.num_cycles: 20
+    grid:
+      experiment.seeds:
+      - [1000]
+      - [1001]
+      - [1002]
+      - [1003]
+      - [1004]
+      - [1005]
+      - [1006]
+      - [1007]
+    max_parallel: 16

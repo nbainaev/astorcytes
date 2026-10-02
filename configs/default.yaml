@@ -34,7 +34,6 @@ reinforce:
   baseline_decay: 0.01
   policy_mix_beta: 0.0
   trace_decay: 0.95
-  enable_stdp_during_training: true
   surrogate:
     type: "lif"
 
@@ -53,6 +52,8 @@ experiment:
 
 output_dir: "results"
 logger_type: "file"
+runtime:
+  torch_num_threads: 1
 comet:
   workspace: null
   project_name: null

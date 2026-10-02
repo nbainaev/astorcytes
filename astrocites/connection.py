@@ -107,7 +107,12 @@ class Connection(torch.nn.Module):
     def update(self, **kwargs):
         self.update_rule.update(**kwargs)
 
-    def accumulate_trace(self, s_idx, adj_positions, grad_slice, step_reward):
+    def accumulate_return(self, step_reward):
+        """Accumulate discounted episode return independently of eligibility."""
+        self.reward_accumulator += self.discount * step_reward
+        self.discount *= self.gamma
+
+    def accumulate_trace(self, s_idx, adj_positions, grad_slice, step_reward=None):
         """Accumulate one step of the REINFORCE eligibility trace.
 
         Parameters
@@ -120,14 +125,17 @@ class Connection(torch.nn.Module):
             Precomputed closed-form eligibility gradient ``d log pi / d w[s, a]``
             for each candidate action ``a`` (length ``len(adj_positions)``),
             produced by :func:`astrocites.surrogate.eligibility_gradient`.
-        step_reward : float
-            Reward received for the action taken this step.
+        step_reward : float, optional
+            Reward received for the action taken this step. When omitted, only
+            the eligibility trace is updated.
         """
         self.eligibility *= self.trace_decay
         idx_tensor = torch.as_tensor(adj_positions, dtype=torch.long)
         self.eligibility[s_idx, idx_tensor] += grad_slice
-        self.reward_accumulator += self.discount * step_reward
-        self.discount *= self.gamma
+        # Keep the historical convenience behavior for external callers while
+        # allowing frozen evaluation to collect return without eligibility.
+        if step_reward is not None:
+            self.accumulate_return(step_reward)
 
     def compute_and_apply_reinforce_update(self, lr, mask=None):
         advantage = self.reward_accumulator - self.running_baseline

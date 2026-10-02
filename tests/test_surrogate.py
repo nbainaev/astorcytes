@@ -14,6 +14,7 @@ from astrocites.surrogate import (
     nmda_rate,
     nmda_rate_deriv,
     eligibility_gradient,
+    spike_eligibility,
     build_lif_params,
     build_nmda_params,
 )
@@ -342,10 +343,7 @@ def test_spike_eligibility_sign_and_magnitude():
     probs = torch.tensor([0.15, 0.05, 0.40, 0.30, 0.10])
     chosen_idx = 2
 
-    spike_rates = spike_counts / time_steps
-    onehot = torch.zeros_like(probs)
-    onehot[chosen_idx] = 1.0
-    grad_slice = (onehot - probs) * spike_rates
+    grad_slice = spike_eligibility(probs, spike_counts, chosen_idx, time_steps, temperature=1.0)
 
     assert grad_slice[chosen_idx] > 0, "Chosen action with spikes should have positive eligibility"
     for i in range(len(probs)):
@@ -356,3 +354,14 @@ def test_spike_eligibility_sign_and_magnitude():
 
     expected_chosen = (1.0 - probs[chosen_idx]) * (spike_counts[chosen_idx] / time_steps)
     assert abs(grad_slice[chosen_idx].item() - expected_chosen) < 1e-8
+
+
+def test_spike_eligibility_scales_inversely_with_temperature():
+    probs = torch.tensor([0.2, 0.5, 0.3])
+    spike_counts = torch.tensor([2.0, 5.0, 3.0])
+    chosen_idx = 1
+
+    e_T1 = spike_eligibility(probs, spike_counts, chosen_idx, time_steps=100, temperature=1.0)
+    e_T05 = spike_eligibility(probs, spike_counts, chosen_idx, time_steps=100, temperature=0.5)
+
+    assert torch.allclose(e_T05, 2 * e_T1)

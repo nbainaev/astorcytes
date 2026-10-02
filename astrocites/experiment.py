@@ -156,6 +156,36 @@ def _build_adjacency_data(weights_mask_XY):
         adjacency_tensors.append(torch.as_tensor(adjacent, dtype=torch.long))
     return adjacency_lists, adjacency_tensors
 
+
+def _resolve_enable_stdp(learning_cfg, reinforce_cfg):
+    """Resolve the canonical STDP flag and validate its legacy alias."""
+    canonical = learning_cfg.get("enable_stdp")
+    legacy = reinforce_cfg.get("enable_stdp_during_training")
+    if canonical is not None and legacy is not None:
+        if bool(canonical) != bool(legacy):
+            raise ValueError(
+                "Conflicting STDP settings: use learning.enable_stdp; "
+                "reinforce.enable_stdp_during_training is a legacy alias"
+            )
+        return bool(canonical)
+    if canonical is not None:
+        return bool(canonical)
+    if legacy is not None:
+        return bool(legacy)
+    return True
+
+
+def _configure_runtime(config):
+    runtime_cfg = config.get("runtime", {})
+    num_threads = runtime_cfg.get("torch_num_threads")
+    if num_threads is None:
+        return
+    num_threads = int(num_threads)
+    if num_threads < 1:
+        raise ValueError("runtime.torch_num_threads must be a positive integer")
+    torch.set_num_threads(num_threads)
+
+
 def _condition_label(enable_stdp, enable_reinforce):
     if enable_stdp and enable_reinforce:
         return "stdp+reinforce"
@@ -301,6 +331,8 @@ def setup_and_run_simulation(
     stdp_selected_action_gain=None,
     apply_action_mask=True,
     optimized_connections=True,
+    mask_tensor=None,
+    adjacency_data=None,
 ):
     if baseline_mode not in {"plausible", "main_reference"}:
         raise ValueError(f"Unknown baseline mode: {baseline_mode!r}")
@@ -318,7 +350,8 @@ def setup_and_run_simulation(
     output_layer = LIFNodes(n=NA, traces=True, thresh=thresh * torch.ones(NA), rest=reset, reset=reset, refrac=refrac)
     inhibitor_layer = LIFNodes(n=NA, traces=True, thresh=thresh * torch.ones(NA), rest=reset, reset=reset, refrac=refrac, dt=dt,
                                enable_astrocyte=enable_astrocyte, alpha=alpha, k=k)
-    mask_tensor = torch.as_tensor(weights_mask_XY, dtype=torch.float32)
+    if mask_tensor is None:
+        mask_tensor = torch.as_tensor(weights_mask_XY, dtype=torch.float32)
     conn_XY = Connection(input_layer, output_layer, impulse_amplitude=0.5, impulse_amplitude_2=0.5,
                          impulse_length=40, impulse_shape_factor=0.9, invert=True,
                          update_rule=WeightDependentPostPre, w=weights_init_XY.clone(), nu=[10, 10],
@@ -350,7 +383,9 @@ def setup_and_run_simulation(
     network.add_connection(conn_IY, 'I', 'Y')
     global_monitor = SpikeCountMonitor(network, layer_names=("X", "Y", "I") if diagnostics is not None else ("Y",))
     network.add_monitor(global_monitor, 'Network')
-    adjacency_lists, adjacency_tensors = _build_adjacency_data(weights_mask_XY)
+    if adjacency_data is None:
+        adjacency_data = _build_adjacency_data(weights_mask_XY)
+    adjacency_lists, adjacency_tensors = adjacency_data
     start = t()
     initial_weights = conn_XY.w.detach().clone() if diagnostics is not None else None
     stdp_delta = torch.zeros_like(conn_XY.w) if diagnostics is not None else None
@@ -470,6 +505,8 @@ def setup_and_run_simulation_reinforce(
     stdp_selected_action_gain=None,
     apply_reinforce_update=True,
     optimized_connections=True,
+    mask_tensor=None,
+    adjacency_data=None,
 ):
     if baseline_mode not in {"plausible", "main_reference"}:
         raise ValueError(f"Unknown baseline mode: {baseline_mode!r}")
@@ -487,7 +524,8 @@ def setup_and_run_simulation_reinforce(
     output_layer = LIFNodes(n=NA, traces=True, thresh=thresh * torch.ones(NA), rest=reset, reset=reset, refrac=refrac)
     inhibitor_layer = LIFNodes(n=NA, traces=True, thresh=thresh * torch.ones(NA), rest=reset, reset=reset, refrac=refrac, dt=dt,
                                enable_astrocyte=enable_astrocyte, alpha=alpha, k=k)
-    mask_tensor = torch.as_tensor(weights_mask_XY, dtype=torch.float32)
+    if mask_tensor is None:
+        mask_tensor = torch.as_tensor(weights_mask_XY, dtype=torch.float32)
     conn_XY = Connection(input_layer, output_layer, impulse_amplitude=0.5, impulse_amplitude_2=0.5,
                          impulse_length=40, impulse_shape_factor=0.9, invert=True,
                          update_rule=WeightDependentPostPre, w=weights_init_XY.clone(), nu=[10, 10],
@@ -520,7 +558,9 @@ def setup_and_run_simulation_reinforce(
     network.add_connection(conn_IY, 'I', 'Y')
     global_monitor = SpikeCountMonitor(network, layer_names=("X", "Y", "I") if diagnostics is not None or decision_diagnostics is not None else ("Y",))
     network.add_monitor(global_monitor, 'Network')
-    adjacency_lists, adjacency_tensors = _build_adjacency_data(weights_mask_XY)
+    if adjacency_data is None:
+        adjacency_data = _build_adjacency_data(weights_mask_XY)
+    adjacency_lists, adjacency_tensors = adjacency_data
 
     conn_XY.running_baseline = running_baseline
     use_surrogate = surrogate_kind != "spike"
@@ -630,6 +670,7 @@ def setup_and_run_simulation_reinforce(
         step_reward = step_penalty
         if new_position == goal:
             step_reward += reward_goal
+        conn_XY.accumulate_return(step_reward)
 
         if apply_reinforce_update or decision_diagnostics is not None:
             if use_surrogate:
@@ -682,7 +723,7 @@ def setup_and_run_simulation_reinforce(
                 "output_spikes_episode_so_far": output_spikes,
             })
         if apply_reinforce_update:
-            conn_XY.accumulate_trace(current_position, adjacent_positions, grad_slice, step_reward)
+            conn_XY.accumulate_trace(current_position, adjacent_positions, grad_slice)
             conn_XY.w.data.mul_(mask_tensor)
         current_position = int(new_position)
         positions.append(current_position)
@@ -748,14 +789,19 @@ def setup_and_run_simulation_reinforce(
 
 
 def run_experiment(config: dict, logger: ExperimentLogger = None):
-    if config.get("diagnostics", {}).get("enable", False):
-        torch.set_num_threads(1)
+    _configure_runtime(config)
     if logger is None:
         logger = FileLogger(output_dir=config.get("output_dir", "results"))
 
     N = config["grid_size"]
     NA = N * N
     weights_mask_XY = create_adjacency_matrix(N)
+    mask_tensor = torch.as_tensor(weights_mask_XY, dtype=torch.float32)
+    adjacency_data = _build_adjacency_data(weights_mask_XY)
+    simulation_precompute_args = {
+        "mask_tensor": mask_tensor,
+        "adjacency_data": adjacency_data,
+    }
     n_steps = config["n_steps"]
     current_position = config["start_position"]
     goal = config["goal_position"]
@@ -792,7 +838,6 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
     gamma = reinf_cfg.get("gamma", 0.99)
     baseline_decay = reinf_cfg.get("baseline_decay", 0.01)
     policy_mix_beta = reinf_cfg.get("policy_mix_beta", 0.0)
-    enable_stdp_during_training = reinf_cfg.get("enable_stdp_during_training", True)
     trace_decay = reinf_cfg.get("trace_decay", 0.95)
 
     learning_cfg = config.get("learning", {})
@@ -804,9 +849,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
     if baseline_mode == "main_reference":
         input_mode, input_probability, input_refractory = "legacy_static_positive", None, refrac
         stdp_selected_action_gain = 1.5
-    enable_stdp_during_training = bool(learning_cfg.get(
-        "enable_stdp", enable_stdp_during_training,
-    ))
+    enable_stdp_during_training = _resolve_enable_stdp(learning_cfg, reinf_cfg)
     protocol_cfg = config.get("protocol", {})
     initial_baseline_stdp = bool(protocol_cfg.get(
         "initial_baseline_stdp", baseline_mode == "main_reference",
@@ -934,6 +977,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
             sensory_generator=rngs["eval_sensory"], policy_rng=rngs["eval_action_numpy"],
             baseline_mode=baseline_mode,
             stdp_selected_action_gain=stdp_selected_action_gain,
+            **simulation_precompute_args,
         )
         if diagnostics_enabled:
             all_episode_diagnostics.append({
@@ -991,6 +1035,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                                        "surrogate_kind": surrogate_kind},
                     baseline_mode=baseline_mode,
                     stdp_selected_action_gain=stdp_selected_action_gain,
+                    **simulation_precompute_args,
                 )
             else:
                 positions_train, weights_2d_train, goal_reached_train, elapsed_time_train = setup_and_run_simulation(
@@ -1006,6 +1051,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                     enable_stdp=enable_stdp_during_training,
                     baseline_mode=baseline_mode,
                     stdp_selected_action_gain=stdp_selected_action_gain,
+                    **simulation_precompute_args,
                 )
             if diagnostics_enabled:
                 all_episode_diagnostics.append({
@@ -1061,6 +1107,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                         sensory_generator=rngs["eval_sensory"],
                         policy_rng=rngs["eval_action_numpy"],
                         baseline_mode="main_reference", stdp_selected_action_gain=1.5,
+                        **simulation_precompute_args,
                     )
                 elif reinf_enable:
                     (positions_verify, weights_2d_verify, goal_reached_verify,
@@ -1089,6 +1136,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                         baseline_mode=baseline_mode,
                         stdp_selected_action_gain=stdp_selected_action_gain,
                         apply_reinforce_update=False,
+                        **simulation_precompute_args,
                     )
                     if verify_baseline != running_baseline:
                         raise RuntimeError("Frozen verification changed the REINFORCE baseline")
@@ -1107,6 +1155,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                         policy_rng=rngs["eval_action_numpy"], baseline_mode=baseline_mode,
                         stdp_selected_action_gain=stdp_selected_action_gain,
                         apply_action_mask=False,
+                        **simulation_precompute_args,
                     )
 
                 if verification_mode == "frozen_evaluation" and not np.array_equal(
@@ -1185,6 +1234,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                                 baseline_mode=baseline_mode,
                                 stdp_selected_action_gain=stdp_selected_action_gain,
                                 apply_reinforce_update=False,
+                                **simulation_precompute_args,
                                 decision_metadata={
                                     "seed": seed, "experiment_num": experiment_num,
                                     "phase": "frozen_evaluation", "cycle": cycle_num,
@@ -1217,6 +1267,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                                 baseline_mode=baseline_mode,
                                 stdp_selected_action_gain=stdp_selected_action_gain,
                                 apply_action_mask=False,
+                                **simulation_precompute_args,
                             )
                         all_evaluation_rollouts.append({
                             "seed": seed, "experiment_num": experiment_num,
@@ -1239,6 +1290,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                             "route_length": len(eval_positions) - 1,
                             "failure": int(not eval_success),
                             "elapsed_seconds": eval_elapsed,
+                            "reward_return": eval_diag.get("reward_return", np.nan),
                             "input_mode": input_mode,
                             "weight_drift_norm": eval_diag.get("weight_drift_norm", np.nan),
                             "fraction_weights_outside_bounds": eval_diag.get(

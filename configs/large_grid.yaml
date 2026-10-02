@@ -20,6 +20,9 @@ astrocyte:
   alpha: 0.001
   k: 0.2
 
+learning:
+  enable_stdp: true
+
 simulation:
   # Expected Bernoulli candidate events per 1-s window; with dt=1 ms this is p=0.15.
   intensity: 150.0
@@ -38,7 +41,6 @@ reinforce:
   # this is also reinforce gradient scale (0 means no gradient)
   policy_mix_beta: 0.0  # 1.0 - weights, 0.0 - spikes
   trace_decay: 0.99
-  enable_stdp_during_training: true
 
 experiment:
   num_experiments: 3
@@ -46,6 +48,8 @@ experiment:
   num_cycles: 50
 
 output_dir: "results"
+runtime:
+  torch_num_threads: 1
 
 comet:
   workspace: zhekahauska
