@@ -1,6 +1,20 @@
 import torch
 import os
 import numpy as np
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _load_stdp_table(stdp_path):
+    try:
+        table = torch.as_tensor(np.loadtxt(stdp_path), dtype=torch.float32)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Required STDP lookup table not found: {stdp_path}"
+        ) from exc
+    if table.ndim != 2:
+        raise ValueError(f"Expected a 2-D STDP lookup table, got {tuple(table.shape)}")
+    return table
 
 
 class LearningRule:
@@ -25,26 +39,23 @@ class WeightDependentPostPre(LearningRule):
         self.interval = 100
         stdp_path = os.path.join(os.path.dirname(__file__), "..", "STDP.txt")
         try:
-            with open(stdp_path, 'r') as fl:
-                self.STDP_base = torch.zeros([101, 120])
-                i = 0
-                for line in fl:
-                    k = 0
-                    for sym in line.split():
-                        self.STDP_base[i][k] = float(sym)
-                        k += 1
-                    i += 1
-        except FileNotFoundError:
-            self.STDP_base = torch.randn(101, 120) * 0.1
+            self.STDP_base = _load_stdp_table(stdp_path)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Required STDP lookup table not found: {stdp_path}"
+            ) from exc
+        if self.STDP_base.ndim != 2:
+            raise ValueError(f"Expected a 2-D STDP lookup table, got {tuple(self.STDP_base.shape)}")
         self.wmin = getattr(connection, 'wmin', 0.001)
         self.wmax = getattr(connection, 'wmax', 1.0)
 
     def delta_w_custom_single(self, weight, delta_val):
         first_index = int(round(float(weight / self.nu[0] * 100)))
-        if torch.isinf(delta_val) or torch.isnan(delta_val):
+        if not torch.isfinite(torch.as_tensor(delta_val)):
             delta_val = torch.tensor(0.0)
         second_index = int(float(delta_val) + 60)
-        if second_index > 120 or second_index < 0:
+        n_cols = self.STDP_base.shape[1]
+        if second_index < 0 or second_index >= n_cols:
             second_index = 0
         if first_index < 0:
             first_index = -first_index
@@ -57,7 +68,8 @@ class WeightDependentPostPre(LearningRule):
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
         first = torch.round(weight / self.nu[0] * 100).long().abs().clamp(max=100)
         second = (delta.double() + 60).long()
-        second = torch.where((second > 120) | (second < 0), torch.zeros_like(second), second)
+        n_cols = self.STDP_base.shape[1]
+        second = torch.where((second < 0) | (second >= n_cols), torch.zeros_like(second), second)
         return self.STDP_base[first, second]
 
     def update(self, current_position=None, adjacent_positions=None, **kwargs):
@@ -82,6 +94,7 @@ class WeightDependentPostPre(LearningRule):
 
             decay_factor = self.reduction(torch.bmm(torch.ones_like(source_x), target_s), dim=0).view(-1)
             update = update + (-self.post_spike_weight_decay) * w_adj * decay_factor
+            conn.last_stdp_update_raw = update.detach()
             conn.w.data[current_position, adj] += update
         else:
             batch_size = self.connection.source.batch_size
@@ -98,11 +111,26 @@ class WeightDependentPostPre(LearningRule):
             update += self.nu[1] * self.delta_w_custom(-self.tc_trace * torch.log(outer_product))
             update += (-self.post_spike_weight_decay) * self.connection.w * self.reduction(
                 torch.bmm(torch.ones(source_x.shape), target_s), dim=0)
-            self.connection.w += update
+            self.connection.last_stdp_update_raw = update.detach()
+            self.connection.w.data += update
         super().update()
+        main_reference_stdp = getattr(self.connection, "main_reference_stdp", False)
+        enforce_bounds = getattr(
+            self.connection, "enforce_post_stdp_bounds", not main_reference_stdp,
+        )
+        if enforce_bounds:
+            self.connection.w.data.clamp_(self.wmin, self.wmax)
+        structural_mask = getattr(self.connection, "structural_mask", None)
+        apply_mask = getattr(
+            self.connection, "apply_structural_mask_during_stdp", not main_reference_stdp,
+        )
+        if structural_mask is not None and apply_mask:
+            self.connection.w.data.masked_fill_(
+                ~structural_mask.to(device=self.connection.w.device, dtype=torch.bool), 0
+            )
 
     def delta_w_custom(self, delta):
-        raise NotImplementedError("delta_w_custom not implemented for batch mode")
+        return self._stdp_lookup(self.connection.w.detach(), delta)
 
 
 class NoOp(LearningRule):

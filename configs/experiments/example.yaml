@@ -58,6 +58,7 @@ experiments:
     base_config: configs/default.yaml
     overrides:
       logger: file
+      experiment.num_experiments: 2
     grid:
       experiment.seeds: [[42, 123], [456, 789]]
       astrocyte.alpha: [0.001, 0.01]
@@ -71,6 +72,7 @@ experiments:
     base_config: configs/default.yaml
     overrides:
       logger: file
+      experiment.num_experiments: 2
     grid:
       experiment.seeds: [[42, 123]]
       astrocyte.enable: [true, false]
@@ -84,9 +86,10 @@ experiments:
     overrides:
       logger: file
       astrocyte.enable: true
+      experiment.num_experiments: 3
+      experiment.num_cycles: 5
     grid:
       experiment.seeds: [[42, 123, 456]]
       reinforce.learning_rate: [0.01, 0.001]
       reinforce.gamma: [0.99, 0.95]
-    num_cycles: 5
     max_parallel: 4

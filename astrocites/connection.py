@@ -8,6 +8,9 @@ class Connection(torch.nn.Module):
                  impulse_length=40, impulse_shape_factor=0.9, invert=False,
                  update_rule=NoOp, w=None, nu=None, wmin=0, wmax=1,
                  weight_decay=0, post_spike_weight_decay=0,
+                 diagonal_connection=False, enforce_post_stdp_bounds=True,
+                 apply_structural_mask_during_stdp=True,
+                 clamp_initial_weights=True,
                  baseline_decay=0.01, policy_mix_beta=0.5,
                  gamma=0.99, trace_decay=0.95, temperature=1.0, **kwargs):
         super().__init__()
@@ -15,13 +18,19 @@ class Connection(torch.nn.Module):
         self.target = target
         self.wmin = wmin
         self.wmax = wmax
+        self.diagonal_connection = bool(diagonal_connection)
+        self.enforce_post_stdp_bounds = bool(enforce_post_stdp_bounds)
+        self.apply_structural_mask_during_stdp = bool(apply_structural_mask_during_stdp)
+        self.clamp_initial_weights = bool(clamp_initial_weights)
         if w is None:
             if self.wmin == -np.inf or self.wmax == np.inf:
                 w = torch.clamp(torch.rand(source.n, target.n), self.wmin, self.wmax)
             else:
                 w = self.wmin + torch.rand(source.n, target.n) * (self.wmax - self.wmin)
         else:
-            if self.wmin != -np.inf or self.wmax != np.inf:
+            if self.clamp_initial_weights and (
+                self.wmin != -np.inf or self.wmax != np.inf
+            ):
                 w = torch.clamp(w, self.wmin, self.wmax)
         self.w = torch.nn.Parameter(w, False)
         self.update_rule = update_rule(self, nu=nu, weight_decay=weight_decay,
@@ -80,11 +89,19 @@ class Connection(torch.nn.Module):
         st *= (st < self.impulse_length).float()
         return impulse
 
-    def compute(self, s: torch.Tensor) -> torch.Tensor:
+    def compute(self, s: torch.Tensor, active_source=None, optimized=True) -> torch.Tensor:
         impulse = self.update_impulse_state(s)
         self.a_pre += impulse
         self.a_pre *= (self.impulse_state > 0).float()
-        a_post = self.a_pre @ self.w
+        if optimized and self.diagonal_connection:
+            a_post = self.a_pre * torch.diagonal(self.w)
+        elif optimized and active_source is not None:
+            # Navigation input is restricted to the current state. Keeping the
+            # dense W tensor while multiplying its active row is exactly the
+            # dense product under that input invariant.
+            a_post = self.a_pre[int(active_source)] * self.w[int(active_source), :]
+        else:
+            a_post = self.a_pre @ self.w
         return a_post.view(1, *self.target.shape)
 
     def update(self, **kwargs):

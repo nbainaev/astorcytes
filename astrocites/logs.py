@@ -41,6 +41,7 @@ class FileLogger(ExperimentLogger):
         self.experiment_name = experiment_name or f"experiment_{timestamp}"
         self.exp_dir = self.output_dir / self.experiment_name
         self.exp_dir.mkdir(parents=True, exist_ok=True)
+        self._active_exp_dir = self.exp_dir
         self.params_path = self.exp_dir / "params.json"
         self.metrics_path = self.exp_dir / "metrics.jsonl"
         self._metrics_file = open(self.metrics_path, 'a')
@@ -70,8 +71,14 @@ class FileLogger(ExperimentLogger):
             shutil.copy2(src, dst)
 
     def start_experiment(self, name: str):
+        if not self._metrics_file.closed:
+            self._metrics_file.close()
         self._active_exp_dir = self.exp_dir / name
         self._active_exp_dir.mkdir(parents=True, exist_ok=True)
+        self.params_path = self._active_exp_dir / "params.json"
+        self.metrics_path = self._active_exp_dir / "metrics.jsonl"
+        self._metrics_file = open(self.metrics_path, "a")
+        self._params = {}
 
     @property
     def active_exp_dir(self) -> Path:

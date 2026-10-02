@@ -66,9 +66,9 @@ def main():
     if args.output_dir is not None:
         config["output_dir"] = args.output_dir
     if args.num_experiments is not None:
-        config["num_experiments"] = args.num_experiments
+        config.setdefault("experiment", {})["num_experiments"] = args.num_experiments
     if args.num_cycles is not None:
-        config["num_cycles"] = args.num_cycles
+        config.setdefault("experiment", {})["num_cycles"] = args.num_cycles
 
     run_name = names_generator.generate_name()
     config["run_name"] = run_name

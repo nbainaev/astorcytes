@@ -187,6 +187,19 @@ def eligibility_gradient(adj_positions, chosen_idx, I_eff, c, temperature, kind,
     return (1.0 / temperature) * (onehot - probs) * rate_deriv * c
 
 
+def spike_eligibility(probs, spike_counts, chosen_idx, time_steps, temperature):
+    """Return the score-like spike eligibility for one sampled action."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if time_steps <= 0:
+        raise ValueError("time_steps must be positive")
+
+    spike_rates = spike_counts / time_steps
+    onehot = torch.zeros_like(probs)
+    onehot[chosen_idx] = 1.0
+    return ((onehot - probs) * spike_rates) / temperature
+
+
 def build_lif_params(thresh, dt, tc_decay, refrac):
     """Convenience: pack the neuron constants into the dict expected by the
     ``"lif"`` surrogate, computing ``decay`` from ``dt`` and ``tc_decay``."""

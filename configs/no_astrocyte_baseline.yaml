@@ -21,7 +21,8 @@ astrocyte:
   k: 0.2
 
 simulation:
-  intensity: 15.0
+  # Expected Bernoulli candidate events per 1-s window; with dt=1 ms this is p=0.15.
+  intensity: 150.0
   time_steps: 1000
   dt: 1
 

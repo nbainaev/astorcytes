@@ -1,4 +1,8 @@
 experiment_name: "default"
+baseline_mode: plausible
+
+learning:
+  enable_stdp: true
 
 grid_size: 5
 start_position: 4
@@ -35,13 +39,16 @@ reinforce:
     type: "lif"
 
 simulation:
-  intensity: 15.0
+  input_mode: paper_bernoulli
+  # Expected Bernoulli candidate events per 1-s window; with dt=1 ms this is p=0.15.
+  # Input's source-faithful 40-ms refractory gate limits accepted X spikes afterward.
+  intensity: 150.0
   time_steps: 1000
   dt: 1
 
 experiment:
   num_experiments: 3
-  seeds: [42, 223]
+  seeds: [42, 223, 1337]  # Fixed third seed keeps all configured experiments reproducible.
   num_cycles: 2
 
 output_dir: "results"
