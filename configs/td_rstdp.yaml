@@ -1,0 +1,69 @@
+experiment_name: td_rstdp_5x5
+baseline_mode: plausible
+
+grid_size: 5
+start_position: 0
+goal_position: 24
+n_steps: 100
+
+neuron:
+  learning_rate: 1.0
+  wmin: 0.001
+  wmax: 1.0
+  weight_decay: 0.0
+  post_spike_weight_decay: 0.005
+  reset: 0
+  refrac: 40
+  thresh: 7
+
+astrocyte:
+  enable: false
+  alpha: 0.001
+  k: 0.2
+
+learning:
+  enable_stdp: false
+
+reinforce:
+  enable: false
+  policy_mix_beta: 0.0
+
+actor_critic:
+  enable: true
+  actor_rule: td_rstdp
+  critic: tabular_td0
+  actor_learning_rate: 0.001
+  critic_learning_rate: 0.1
+  gamma: 0.99
+  eligibility_tau_ms: 1000.0
+  temperature: 1.0
+  policy: spike_softmax
+  actor_weight_decay: 0.0
+  save_critic_values: true
+  save_critic_heatmap: true
+
+simulation:
+  input_mode: paper_bernoulli
+  intensity: 150.0
+  time_steps: 1000
+  dt: 1
+
+protocol:
+  initial_baseline_stdp: false
+  verification_mode: frozen_evaluation
+
+experiment:
+  num_experiments: 5
+  seeds: [42, 223, 1337, 1004, 1005]
+  num_cycles: 50
+
+diagnostics:
+  enable: true
+  evaluation_rollouts: 20
+  evaluation_checkpoints: [50]
+  evaluation_astrocyte_modes: [false]
+
+output_dir: results/td_rstdp
+logger_type: file
+runtime:
+  torch_num_threads: 1

@@ -133,6 +133,44 @@ class WeightDependentPostPre(LearningRule):
         return self._stdp_lookup(self.connection.w.detach(), delta)
 
 
+class EligibilityPostPre(WeightDependentPostPre):
+    """Accumulate local STDP tags without directly changing actor weights.
+
+    The post-spike weight decay used by ordinary STDP is deliberately omitted:
+    this rule records only the pre/post pair terms for later TD modulation.
+    """
+
+    def update(self, current_position=None, adjacent_positions=None, **kwargs):
+        if current_position is None or adjacent_positions is None:
+            raise ValueError(
+                "EligibilityPostPre requires current_position and adjacent_positions"
+            )
+        conn = self.connection
+        if not getattr(conn, "rstdp_enabled", False):
+            raise RuntimeError("EligibilityPostPre requires enabled R-STDP state")
+
+        adj = torch.as_tensor(adjacent_positions, dtype=torch.long)
+        weights = conn.w[current_position, adj]
+        source_s = conn.source.s[:, current_position].float().unsqueeze(1).unsqueeze(2)
+        source_x = conn.source.x[:, current_position].unsqueeze(1).unsqueeze(2)
+        target_s = conn.target.s[:, adj].float().unsqueeze(1)
+        target_x = conn.target.x_neg[:, adj].unsqueeze(1)
+
+        pre_pair = self.reduction(torch.bmm(source_s, target_x), dim=0).view(-1)
+        pre_delta = self.tc_trace_neg * torch.log(torch.clamp(pre_pair, min=1e-10))
+        local_tag = self.nu[0] * self._stdp_lookup(weights, pre_delta)
+
+        post_pair = self.reduction(torch.bmm(source_x, target_s), dim=0).view(-1)
+        post_delta = -self.tc_trace * torch.log(torch.clamp(post_pair, min=1e-10))
+        local_tag = local_tag + self.nu[1] * self._stdp_lookup(weights, post_delta)
+
+        # Capture the signed local third-factor precursor only. In particular,
+        # don't call super().update(): that path writes directly to W, applies
+        # ordinary weight decay, clipping, and structural masking.
+        conn.rstdp_drive[current_position, adj] += local_tag
+        conn.last_rstdp_signal_raw = local_tag.detach()
+
+
 class NoOp(LearningRule):
     def update(self, **kwargs):
         super().update()

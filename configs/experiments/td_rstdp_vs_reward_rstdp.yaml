@@ -1,0 +1,40 @@
+# Paired mechanism control: same seeds/configuration, changing only the global
+# actor modulator (TD error with a tabular critic vs immediate reward).
+max_parallel: 10
+schedule: interleaved
+
+experiments:
+  - name: td_rstdp
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/td_rstdp.yaml
+    output_dir: results/td_rstdp_vs_reward_rstdp/td_rstdp
+    num_experiments: 1
+    num_cycles: 50
+    max_parallel: 5
+    overrides:
+      actor_critic.enable: true
+      actor_critic.actor_rule: td_rstdp
+      actor_critic.critic: tabular_td0
+      astrocyte.enable: false
+      learning.enable_stdp: false
+      reinforce.enable: false
+    grid:
+      experiment.seeds: [[42], [223], [1337], [1004], [1005]]
+
+  - name: reward_rstdp
+    command: .venv/bin/python -m astrocites.run
+    base_config: configs/td_rstdp.yaml
+    output_dir: results/td_rstdp_vs_reward_rstdp/reward_rstdp
+    num_experiments: 1
+    num_cycles: 50
+    max_parallel: 5
+    overrides:
+      actor_critic.enable: true
+      actor_critic.actor_rule: reward_rstdp
+      actor_critic.critic: none
+      actor_critic.save_critic_values: false
+      astrocyte.enable: false
+      learning.enable_stdp: false
+      reinforce.enable: false
+    grid:
+      experiment.seeds: [[42], [223], [1337], [1004], [1005]]

@@ -2,6 +2,7 @@ import os
 import random
 import json
 import csv
+import math
 from pathlib import Path
 import numpy as np
 import torch
@@ -10,7 +11,8 @@ from time import time as t
 
 from astrocites.nodes import Input, LIFNodes
 from astrocites.connection import Connection
-from astrocites.learning import WeightDependentPostPre, NoOp
+from astrocites.learning import WeightDependentPostPre, EligibilityPostPre, NoOp
+from astrocites.critic import TabularTDCritic
 from astrocites.network import Network, SpikeCountMonitor
 from astrocites.utils import (
     bernoulli_loader, create_adjacency_matrix, make_rng_streams, derive_seed,
@@ -56,7 +58,7 @@ def _fill_simulation_diagnostics(
     astro_active_neuron_steps=0, astro_neuron_steps=0,
     astro_threshold_drop_sum=0.0, reinforce_delta=None, reinforce_preclip=None,
     reward_return=0.0, baseline_before=None, baseline_after=None,
-    update_interaction=None,
+    update_interaction=None, actor_critic_metrics=None,
 ):
     if diagnostics is None:
         return
@@ -115,6 +117,8 @@ def _fill_simulation_diagnostics(
             diagnostics[f"current_l1_{connection_name}"] = float(value)
     if update_interaction:
         diagnostics.update(update_interaction)
+    if actor_critic_metrics:
+        diagnostics.update(actor_critic_metrics)
 
 
 def _apply_selected_action_stdp_gain(connection, weights_before, current_position,
@@ -194,6 +198,15 @@ def _condition_label(enable_stdp, enable_reinforce):
     if enable_reinforce:
         return "reinforce"
     return "none"
+
+
+def select_rstdp_modulator(actor_modulator, immediate_reward, td_error):
+    """Select the global third factor for a reward/TD-modulated STDP actor."""
+    if actor_modulator == "td_error":
+        return float(td_error)
+    if actor_modulator == "reward":
+        return float(immediate_reward)
+    raise ValueError(f"Unknown R-STDP actor modulator: {actor_modulator!r}")
 
 def _categorical_divergences(p, q):
     p = p.clamp_min(1e-12)
@@ -278,9 +291,12 @@ def _build_run_summaries(episode_rows, evaluation_rows, seed):
 
     eval_groups = {}
     for row in evaluation_rows:
-        key = (row["condition"], row["astrocyte_enabled"], row["checkpoint_cycle"])
+        key = (
+            row["condition"], row["astrocyte_enabled"], row["checkpoint_cycle"],
+            row.get("evaluation_policy", "default"),
+        )
         eval_groups.setdefault(key, {}).setdefault(row["seed"], []).append(row)
-    for (algorithm, astro, cycle), per_seed in eval_groups.items():
+    for (algorithm, astro, cycle, evaluation_policy), per_seed in eval_groups.items():
         seed_metric_values = {metric: [] for metric in (
             "success_rate", "failure_rate", "mean_route_length",
             "mean_success_route_length", "median_route_length",
@@ -308,7 +324,10 @@ def _build_run_summaries(episode_rows, evaluation_rows, seed):
                 vals = [float(row[metric]) for row in seed_rows if row.get(metric) is not None]
                 metric_key = "weight_drift_norm" if metric == "weight_drift_norm" else f"mean_{metric}"
                 seed_metric_values[metric_key].append(float(np.mean(vals)) if vals else np.nan)
-        label = f"frozen_eval:{algorithm}:astro={astro}:cycle={cycle}"
+        label = (
+            f"frozen_eval:{algorithm}:astro={astro}:cycle={cycle}"
+            f":policy={evaluation_policy}"
+        )
         for metric, values in seed_metric_values.items():
             valid = [value for value in values if np.isfinite(value)]
             records.append(_stats_record(label, metric, valid, len(valid), rng))
@@ -481,6 +500,352 @@ def setup_and_run_simulation(
         astro_threshold_drop_sum=astro_threshold_drop_sum,
     )
     return positions, weights_2d, reached_goal, elapsed
+
+
+def setup_and_run_simulation_td_rstdp(
+    NA, weights_mask_XY, weights_init_XY, weights_init_XI, n_steps,
+    current_position, goal, learning_rate, wmin, wmax, weight_decay,
+    post_spike_weight_decay, reset, refrac, thresh, intensity, time_steps, dt,
+    enable_astrocyte, alpha, k, critic, actor_learning_rate,
+    eligibility_tau_ms, temperature, reward_goal, step_penalty,
+    input_refractory=None, input_probability=None, input_mode="paper_bernoulli",
+    sensory_generator=None, policy_generator=None, policy_rng=None,
+    actor_weight_decay=0.0, apply_actor_update=True, apply_critic_update=True,
+    policy_mode="spike_softmax", diagnostics=None, actor_step_diagnostics=None,
+    decision_metadata=None, optimized_connections=True, mask_tensor=None,
+    adjacency_data=None, actor_modulator="td_error", gamma=0.99,
+):
+    """Run the independent SNN-actor + reward/TD-modulated STDP path.
+
+    ``EligibilityPostPre`` records only local STDP pair tags during a decision
+    window. Direct ordinary-STDP weight changes and the REINFORCE rule are not
+    used in this execution path. ``actor_modulator="reward"`` is an
+    immediate-reward control and does not update or require a critic.
+    """
+    if policy_mode not in {"spike_softmax", "common_spike_argmax"}:
+        raise ValueError(f"Unknown TD-RSTDP policy mode: {policy_mode!r}")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if eligibility_tau_ms <= 0:
+        raise ValueError("eligibility_tau_ms must be positive")
+    if not 0.0 <= actor_weight_decay < 1.0:
+        raise ValueError("actor_weight_decay must be in [0, 1)")
+    if actor_modulator not in {"td_error", "reward"}:
+        raise ValueError("actor_modulator must be 'td_error' or 'reward'")
+    if actor_modulator == "td_error" and critic is None:
+        raise ValueError("TD-error-modulated R-STDP requires a critic")
+    if actor_modulator == "reward" and apply_critic_update:
+        raise ValueError("Immediate-reward R-STDP must not update a critic")
+    if critic is not None and critic.values.numel() != NA:
+        raise ValueError(f"Critic has {critic.values.numel()} states; expected {NA}")
+
+    network = Network(dt=dt)
+    input_layer = Input(
+        n=NA, traces=True, thresh=thresh, rest=reset, reset=reset,
+        refrac=refrac if input_refractory is None else input_refractory,
+    )
+    output_layer = LIFNodes(
+        n=NA, traces=True, thresh=thresh * torch.ones(NA),
+        rest=reset, reset=reset, refrac=refrac,
+    )
+    inhibitor_layer = LIFNodes(
+        n=NA, traces=True, thresh=thresh * torch.ones(NA),
+        rest=reset, reset=reset, refrac=refrac, dt=dt,
+        enable_astrocyte=enable_astrocyte, alpha=alpha, k=k,
+    )
+    if mask_tensor is None:
+        mask_tensor = torch.as_tensor(weights_mask_XY, dtype=torch.float32)
+
+    conn_XY = Connection(
+        input_layer, output_layer, impulse_amplitude=0.5,
+        impulse_amplitude_2=0.5, impulse_length=40,
+        impulse_shape_factor=0.9, invert=True,
+        update_rule=EligibilityPostPre, w=weights_init_XY.clone(), nu=[10, 10],
+        wmin=wmin, wmax=wmax, weight_decay=0.0,
+        post_spike_weight_decay=0.0, enable_rstdp_state=True,
+    )
+    conn_XY.structural_mask = mask_tensor.bool()
+    conn_XY.w.data.mul_(mask_tensor)
+    conn_XI = Connection(
+        input_layer, inhibitor_layer, impulse_amplitude=0.5,
+        impulse_amplitude_2=0.5, impulse_length=40,
+        impulse_shape_factor=0.9, invert=True, update_rule=NoOp,
+        diagonal_connection=True, w=weights_init_XI, nu=[learning_rate, learning_rate],
+        wmin=-100, wmax=wmax, weight_decay=0.0,
+        post_spike_weight_decay=post_spike_weight_decay,
+    )
+    conn_IY = Connection(
+        inhibitor_layer, output_layer, impulse_amplitude=0.5,
+        impulse_amplitude_2=0.5, impulse_length=40,
+        impulse_shape_factor=0.9, invert=True, update_rule=NoOp,
+        diagonal_connection=True, w=-weights_init_XI,
+        nu=[learning_rate, learning_rate], wmin=-100, wmax=wmax,
+        weight_decay=0.0, post_spike_weight_decay=post_spike_weight_decay,
+    )
+    network.add_layer(input_layer, "X")
+    network.add_layer(output_layer, "Y")
+    network.add_layer(inhibitor_layer, "I")
+    network.add_connection(conn_XY, "X", "Y")
+    network.add_connection(conn_XI, "X", "I")
+    network.add_connection(conn_IY, "I", "Y")
+    network.add_monitor(
+        SpikeCountMonitor(network, layer_names=("X", "Y", "I")), "Network",
+    )
+    if adjacency_data is None:
+        adjacency_data = _build_adjacency_data(weights_mask_XY)
+    adjacency_lists, adjacency_tensors = adjacency_data
+
+    action_window_ms = float(time_steps) * float(dt)
+    eligibility_decay = math.exp(-action_window_ms / float(eligibility_tau_ms))
+    initial_weights = conn_XY.w.detach().clone()
+    episode_return = 0.0
+    reward_discount = 1.0
+    positions = [int(current_position)]
+    x_spikes = y_spikes = i_spikes = raw_input_events = 0
+    raw_input_events_available = True
+    current_l1 = {}
+    astro_active_neuron_steps = astro_neuron_steps = 0
+    astro_threshold_drop_sum = 0.0
+    decision_count = tie_decisions = 0
+    entropy_sum = 0.0
+    td_errors = []
+    eligibility_drive_norms = []
+    eligibility_norms = []
+    actor_update_norms = []
+    start_value = (
+        float(critic.values[int(current_position)].item())
+        if critic is not None else float("nan")
+    )
+    start = t()
+
+    for action_idx in range(n_steps):
+        if current_position == goal:
+            break
+        adjacent_positions = adjacency_lists[current_position]
+        adj_tensor = adjacency_tensors[current_position]
+        sample = _sample_input_spike_train(
+            current_position, NA, intensity, time_steps, dt,
+            probability=input_probability, generator=sensory_generator,
+            input_mode=input_mode,
+        )
+        if sample.ndim == 3:
+            raw_input_events += int(sample.sum().item())
+        else:
+            raw_input_events_available = False
+        network_diagnostics = {} if diagnostics is not None else None
+        network.run(
+            inpts={"X": sample}, time=time_steps,
+            injects_v={"I": torch.full((NA,), 0.02)},
+            current_position=current_position,
+            adjacent_positions=adjacent_positions, conn_XY=conn_XY,
+            # This enables the local tag rule only. EligibilityPostPre never
+            # writes W; actor weights change below, after the TD transition.
+            enable_stdp=apply_actor_update, diagnostics=network_diagnostics,
+            optimized_connections=optimized_connections,
+        )
+        recordings = network.monitors["Network"].get()
+        x_count = int(recordings["X"]["s"].sum().item())
+        y_count = int(recordings["Y"]["s"].sum().item())
+        i_count = int(recordings["I"]["s"].sum().item())
+        x_spikes += x_count
+        y_spikes += y_count
+        i_spikes += i_count
+        if network_diagnostics is not None:
+            for name, value in network_diagnostics.get("synaptic_current_l1", {}).items():
+                current_l1[name] = current_l1.get(name, 0.0) + value
+            for name, value in network_diagnostics.get("net_current_l1", {}).items():
+                key = f"net_{name}"
+                current_l1[key] = current_l1.get(key, 0.0) + value
+            astro_active_neuron_steps += network_diagnostics.get("astro_active_neuron_steps", 0)
+            astro_neuron_steps += network_diagnostics.get("astro_neuron_steps", 0)
+            astro_threshold_drop_sum += network_diagnostics.get("astro_threshold_drop_sum", 0.0)
+
+        all_y_counts = recordings["Y"]["s"].sum(dim=0).reshape(-1)
+        spike_prefs = all_y_counts[adj_tensor].to(dtype=torch.float32)
+        tied_count = int(torch.count_nonzero(spike_prefs == spike_prefs.max()).item())
+        if policy_mode == "spike_softmax":
+            probs = torch.softmax(spike_prefs / temperature, dim=0)
+            if policy_generator is None:
+                selected_idx = torch.multinomial(probs, 1).item()
+            else:
+                selected_idx = torch.multinomial(probs, 1, generator=policy_generator).item()
+            new_position = adjacent_positions[selected_idx]
+            policy_entropy = _categorical_entropy(probs)
+        else:
+            new_position, tied_count = _select_action_from_counts(
+                all_y_counts, weights_mask_XY[current_position], current_position,
+                rng=policy_rng,
+            )
+            selected_idx = adjacent_positions.index(new_position)
+            policy_entropy = math.log(max(tied_count, 1))
+        decision_count += 1
+        tie_decisions += int(tied_count > 1)
+        entropy_sum += policy_entropy
+
+        reward = float(step_penalty) + (float(reward_goal) if new_position == goal else 0.0)
+        done = bool(new_position == goal or action_idx == n_steps - 1)
+        if actor_modulator == "td_error":
+            value_state = float(critic.values[current_position].item())
+            value_next = float(critic.values[new_position].item())
+            td_error = critic.compute_td_error(
+                current_position, reward, new_position, done,
+            )
+            td_error_value = float(td_error.item())
+            td_target = value_state + td_error_value
+            critic_update_signal = td_error
+        else:
+            value_state = value_next = td_target = td_error_value = float("nan")
+            critic_update_signal = None
+        actor_signal = select_rstdp_modulator(
+            actor_modulator, reward, td_error_value,
+        )
+
+        drive = conn_XY.rstdp_drive.detach().clone()
+        drive_norm = float(torch.linalg.vector_norm(drive).item())
+        if apply_actor_update:
+            conn_XY.update_rstdp_eligibility(eligibility_decay)
+        eligibility_norm = float(torch.linalg.vector_norm(conn_XY.rstdp_eligibility).item())
+        if apply_critic_update:
+            critic.update(current_position, critic_update_signal)
+        if apply_actor_update:
+            actor_delta, actor_requested_delta = conn_XY.apply_rstdp_update(
+                actor_signal, actor_learning_rate, mask_tensor,
+                actor_weight_decay=actor_weight_decay,
+            )
+            actor_update_norm = float(torch.linalg.vector_norm(actor_delta).item())
+            actor_update_norms.append(actor_update_norm)
+        else:
+            actor_delta = torch.zeros_like(conn_XY.w)
+            actor_requested_delta = torch.zeros_like(conn_XY.w)
+            actor_update_norm = 0.0
+        if math.isfinite(td_error_value):
+            td_errors.append(td_error_value)
+        eligibility_drive_norms.append(drive_norm)
+        eligibility_norms.append(eligibility_norm)
+        episode_return += reward_discount * reward
+        reward_discount *= float(critic.gamma if critic is not None else gamma)
+
+        allowed_weights = conn_XY.w.detach()[mask_tensor.bool()]
+        at_bounds = (
+            (allowed_weights <= float(wmin) + 1e-8)
+            | (allowed_weights >= float(wmax) - 1e-8)
+        )
+        saturation_fraction = float(at_bounds.float().mean().item()) if at_bounds.numel() else 0.0
+        fraction_at_wmin = float(
+            (allowed_weights <= float(wmin) + 1e-8).float().mean().item()
+        ) if allowed_weights.numel() else 0.0
+        fraction_at_wmax = float(
+            (allowed_weights >= float(wmax) - 1e-8).float().mean().item()
+        ) if allowed_weights.numel() else 0.0
+        if actor_step_diagnostics is not None:
+            actor_step_diagnostics.append({
+                **(decision_metadata or {}),
+                "decision_index": len(positions) - 1,
+                "state": int(current_position),
+                "next_state": int(new_position),
+                "chosen_action": int(new_position),
+                "reward": reward,
+                "done": int(done),
+                "actor_modulator": actor_modulator,
+                "actor_signal": actor_signal,
+                "value_state": value_state,
+                "value_next": value_next,
+                "td_target": td_target,
+                "td_error": td_error_value,
+                "abs_td_error": abs(td_error_value),
+                "eligibility_drive_norm": drive_norm,
+                "eligibility_norm": eligibility_norm,
+                "actor_update_norm": actor_update_norm,
+                "actor_requested_update_norm": float(
+                    torch.linalg.vector_norm(actor_requested_delta).item()
+                ),
+                "w_min": float(allowed_weights.min().item()) if allowed_weights.numel() else 0.0,
+                "w_max": float(allowed_weights.max().item()) if allowed_weights.numel() else 0.0,
+                "weight_saturation_fraction": saturation_fraction,
+                "fraction_at_wmin": fraction_at_wmin,
+                "fraction_at_wmax": fraction_at_wmax,
+                "policy_mode": policy_mode,
+                "apply_actor_update": bool(apply_actor_update),
+                "apply_critic_update": bool(apply_critic_update),
+                "policy_entropy": policy_entropy,
+                "candidate_positions": json.dumps(adjacent_positions),
+                "candidate_y_spike_counts": json.dumps(spike_prefs.tolist()),
+                "X_spikes": x_count,
+                "Y_spikes": y_count,
+                "I_spikes": i_count,
+                "tie_count": tied_count,
+                "astro_active_fraction": network_diagnostics.get("astro_active_fraction", 0.0)
+                if network_diagnostics is not None else 0.0,
+            })
+
+        current_position = int(new_position)
+        positions.append(current_position)
+        network.reset_()
+
+    elapsed = t() - start
+    reached_goal = int(current_position == goal)
+    weights_2d = conn_XY.w.detach().cpu().numpy()
+    final_values = critic.values.detach() if critic is not None else None
+    seen_states = {positions[0]}
+    revisit_count = 0
+    for visited_state in positions[1:]:
+        revisit_count += int(visited_state in seen_states)
+        seen_states.add(visited_state)
+    backtrack_count = sum(
+        positions[index] == positions[index - 2]
+        for index in range(2, len(positions))
+    )
+    actor_critic_metrics = {
+        "episode_return": float(episode_return),
+        "unique_states_visited": len(seen_states),
+        "revisit_count": int(revisit_count),
+        "revisit_rate": float(revisit_count / decision_count) if decision_count else 0.0,
+        "immediate_backtrack_rate": (
+            float(backtrack_count / (len(positions) - 2)) if len(positions) > 2 else 0.0
+        ),
+        "mean_abs_td_error": (
+            float(np.mean(np.abs(td_errors))) if td_errors
+            else (float("nan") if actor_modulator == "reward" else 0.0)
+        ),
+        "rms_td_error": (
+            float(np.sqrt(np.mean(np.square(td_errors)))) if td_errors
+            else (float("nan") if actor_modulator == "reward" else 0.0)
+        ),
+        "actor_modulator": actor_modulator,
+        "mean_eligibility_drive_norm": float(np.mean(eligibility_drive_norms)) if eligibility_drive_norms else 0.0,
+        "mean_eligibility_norm": float(np.mean(eligibility_norms)) if eligibility_norms else 0.0,
+        "mean_actor_update_norm": float(np.mean(actor_update_norms)) if actor_update_norms else 0.0,
+        "actor_update_norm_sum": float(np.sum(actor_update_norms)),
+        "critic_value_start": start_value,
+        "critic_value_min": float(final_values.min().item()) if final_values is not None else float("nan"),
+        "critic_value_max": float(final_values.max().item()) if final_values is not None else float("nan"),
+        "weight_saturation_fraction": float((
+            (conn_XY.w.detach()[mask_tensor.bool()] <= float(wmin) + 1e-8)
+            | (conn_XY.w.detach()[mask_tensor.bool()] >= float(wmax) - 1e-8)
+        ).float().mean().item()) if bool(mask_tensor.bool().any()) else 0.0,
+        "fraction_at_wmin": float((
+            conn_XY.w.detach()[mask_tensor.bool()] <= float(wmin) + 1e-8
+        ).float().mean().item()) if bool(mask_tensor.bool().any()) else 0.0,
+        "fraction_at_wmax": float((
+            conn_XY.w.detach()[mask_tensor.bool()] >= float(wmax) - 1e-8
+        ).float().mean().item()) if bool(mask_tensor.bool().any()) else 0.0,
+        "policy_mode": policy_mode,
+        "eligibility_decay_per_action": eligibility_decay,
+    }
+    _fill_simulation_diagnostics(
+        diagnostics, positions, reached_goal, elapsed, conn_XY, mask_tensor,
+        initial_weights, torch.zeros_like(conn_XY.w), x_spikes, y_spikes,
+        inhibitory_spikes=i_spikes,
+        raw_input_events=raw_input_events if raw_input_events_available else np.nan,
+        tie_decisions=tie_decisions, decision_count=decision_count,
+        behavior_entropy_sum=entropy_sum, current_l1=current_l1,
+        astro_active_neuron_steps=astro_active_neuron_steps,
+        astro_neuron_steps=astro_neuron_steps,
+        astro_threshold_drop_sum=astro_threshold_drop_sum,
+        reward_return=episode_return,
+        actor_critic_metrics=actor_critic_metrics,
+    )
+    return positions, weights_2d, reached_goal, elapsed, episode_return
 
 
 def setup_and_run_simulation_reinforce(
@@ -840,6 +1205,18 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
     policy_mix_beta = reinf_cfg.get("policy_mix_beta", 0.0)
     trace_decay = reinf_cfg.get("trace_decay", 0.95)
 
+    actor_critic_cfg = config.get("actor_critic", {})
+    actor_critic_enable = bool(actor_critic_cfg.get("enable", False))
+    actor_learning_rate = float(actor_critic_cfg.get("actor_learning_rate", 0.001))
+    critic_learning_rate = float(actor_critic_cfg.get("critic_learning_rate", 0.1))
+    actor_critic_gamma = float(actor_critic_cfg.get("gamma", 0.99))
+    eligibility_tau_ms = float(actor_critic_cfg.get("eligibility_tau_ms", 1000.0))
+    actor_temperature = float(actor_critic_cfg.get("temperature", 1.0))
+    actor_weight_decay = float(actor_critic_cfg.get("actor_weight_decay", 0.0))
+    actor_policy = actor_critic_cfg.get("policy", "spike_softmax")
+    actor_rule = actor_critic_cfg.get("actor_rule", "td_rstdp")
+    critic_kind = actor_critic_cfg.get("critic", "tabular_td0")
+
     learning_cfg = config.get("learning", {})
     baseline_mode = config.get("baseline_mode", learning_cfg.get("baseline_mode", "plausible"))
     stdp_selected_action_gain = float(learning_cfg.get(
@@ -850,6 +1227,34 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
         input_mode, input_probability, input_refractory = "legacy_static_positive", None, refrac
         stdp_selected_action_gain = 1.5
     enable_stdp_during_training = _resolve_enable_stdp(learning_cfg, reinf_cfg)
+    if actor_critic_enable:
+        if reinf_enable:
+            raise ValueError("TD-RSTDP and REINFORCE cannot be enabled together")
+        if enable_stdp_during_training:
+            raise ValueError(
+                "TD-RSTDP requires learning.enable_stdp=false; its local "
+                "EligibilityPostPre rule is not ordinary direct-weight STDP"
+            )
+        if baseline_mode != "plausible":
+            raise ValueError("TD-RSTDP currently supports baseline_mode='plausible' only")
+        if actor_rule == "td_rstdp" and critic_kind != "tabular_td0":
+            raise ValueError("actor_rule=td_rstdp requires critic=tabular_td0")
+        if actor_rule == "reward_rstdp" and critic_kind not in {"none", None}:
+            raise ValueError("actor_rule=reward_rstdp requires critic=none")
+        if actor_rule not in {"td_rstdp", "reward_rstdp"}:
+            raise ValueError("actor_rule must be td_rstdp or reward_rstdp")
+        if actor_policy != "spike_softmax":
+            raise ValueError("TD-RSTDP training currently requires policy=spike_softmax")
+        if policy_mix_beta != 0.0:
+            raise ValueError("TD-RSTDP uses Y spike counts only; policy_mix_beta must be 0")
+        if actor_learning_rate < 0 or critic_learning_rate < 0:
+            raise ValueError("TD-RSTDP learning rates must be non-negative")
+        if eligibility_tau_ms <= 0 or actor_temperature <= 0:
+            raise ValueError("eligibility_tau_ms and actor temperature must be positive")
+        if not 0.0 <= actor_critic_gamma <= 1.0:
+            raise ValueError("actor_critic.gamma must be in [0, 1]")
+        if not 0.0 <= actor_weight_decay < 1.0:
+            raise ValueError("actor_weight_decay must be in [0, 1)")
     protocol_cfg = config.get("protocol", {})
     initial_baseline_stdp = bool(protocol_cfg.get(
         "initial_baseline_stdp", baseline_mode == "main_reference",
@@ -914,6 +1319,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
     all_episode_diagnostics = []
     all_evaluation_rollouts = []
     all_policy_diagnostics = []
+    all_actor_critic_steps = []
     evaluation_rollouts = int(diagnostic_cfg.get("evaluation_rollouts", 20))
     evaluation_checkpoints = set(diagnostic_cfg.get("evaluation_checkpoints", [num_cycles]))
     evaluation_astrocyte_modes = diagnostic_cfg.get("evaluation_astrocyte_modes", [False, True])
@@ -940,11 +1346,31 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
             "enforce_post_stdp_bounds": baseline_mode != "main_reference",
             "chosen_stdp_gain": stdp_selected_action_gain,
             "verification_mode": verification_mode,
+            "enable_actor_critic": actor_critic_enable,
+            "actor_rule": actor_rule if actor_critic_enable else None,
+            "critic": critic_kind if actor_critic_enable else None,
+            "actor_learning_rate": actor_learning_rate if actor_critic_enable else None,
+            "critic_learning_rate": critic_learning_rate if actor_critic_enable else None,
+            "actor_critic_gamma": actor_critic_gamma if actor_critic_enable else None,
+            "eligibility_tau_ms": eligibility_tau_ms if actor_critic_enable else None,
+            "actor_policy": actor_policy if actor_critic_enable else None,
         })
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         rngs = make_rng_streams(seed)
+        td_critic = (
+            TabularTDCritic(
+                n_states=NA, learning_rate=critic_learning_rate,
+                gamma=actor_critic_gamma,
+                init_value=float(actor_critic_cfg.get("init_value", 0.0)),
+            )
+            if actor_critic_enable and actor_rule == "td_rstdp" else None
+        )
+        training_condition = (
+            actor_rule if actor_critic_enable
+            else _condition_label(enable_stdp_during_training, reinf_enable)
+        )
 
         weights_rand_dist_XY = rngs["weights"].normal(0.65, 0.1, size=(NA, NA))
         weights_rand_dist_XY[weights_rand_dist_XY > 0.8] = 0.8
@@ -1006,7 +1432,47 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
             print(f"{'=' * 60}")
 
             train_diag = {} if diagnostics_enabled else None
-            if reinf_enable:
+            training_episode_return = np.nan
+            if actor_critic_enable:
+                (positions_train, weights_2d_train, goal_reached_train,
+                 elapsed_time_train, training_episode_return) = setup_and_run_simulation_td_rstdp(
+                    NA=NA, weights_mask_XY=weights_mask_XY,
+                    weights_init_XY=weights_init_XY,
+                    weights_init_XI=weights_init_XI, n_steps=n_steps,
+                    current_position=current_position, goal=goal,
+                    learning_rate=learning_rate, wmin=wmin, wmax=wmax,
+                    weight_decay=weight_decay,
+                    post_spike_weight_decay=post_spike_weight_decay,
+                    reset=reset, refrac=refrac, thresh=thresh,
+                    intensity=intensity, time_steps=time_steps, dt=dt,
+                    enable_astrocyte=enable_astrocyte, alpha=alpha, k=k,
+                    critic=td_critic, actor_learning_rate=actor_learning_rate,
+                    eligibility_tau_ms=eligibility_tau_ms,
+                    temperature=actor_temperature, reward_goal=reward_goal,
+                    step_penalty=step_penalty,
+                    input_refractory=input_refractory,
+                    input_probability=input_probability, input_mode=input_mode,
+                    sensory_generator=rngs["sensory"],
+                    policy_generator=rngs["action_torch"],
+                    actor_weight_decay=actor_weight_decay,
+                    actor_modulator=(
+                        "reward" if actor_rule == "reward_rstdp" else "td_error"
+                    ),
+                    gamma=actor_critic_gamma,
+                    apply_critic_update=(actor_rule == "td_rstdp"),
+                    policy_mode="spike_softmax", diagnostics=train_diag,
+                    actor_step_diagnostics=(
+                        all_actor_critic_steps if diagnostics_enabled else None
+                    ),
+                    decision_metadata={
+                        "seed": seed, "experiment_num": experiment_num,
+                        "phase": "training", "cycle": cycle_num,
+                        "condition": training_condition,
+                        "astrocyte_enabled": enable_astrocyte,
+                    },
+                    **simulation_precompute_args,
+                )
+            elif reinf_enable:
                 positions_train, weights_2d_train, goal_reached_train, elapsed_time_train, running_baseline = setup_and_run_simulation_reinforce(
                     NA=NA, weights_mask_XY=weights_mask_XY, weights_init_XY=weights_init_XY,
                     weights_init_XI=weights_init_XI, n_steps=n_steps, current_position=current_position,
@@ -1057,8 +1523,8 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                 all_episode_diagnostics.append({
                     "seed": seed, "experiment_num": experiment_num,
                     "phase": "training", "cycle": cycle_num,
-                    "algorithm": _condition_label(enable_stdp_during_training, reinf_enable),
-                    "condition": _condition_label(enable_stdp_during_training, reinf_enable),
+                    "algorithm": training_condition,
+                    "condition": training_condition,
                     "baseline_mode": baseline_mode,
                     "input_mode": input_mode,
                     "enable_stdp": enable_stdp_during_training,
@@ -1069,6 +1535,8 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                     "verification_mode": verification_mode,
                     "training_stdp_enabled": enable_stdp_during_training,
                     "training_reinforce_enabled": reinf_enable,
+                    "enable_actor_critic": actor_critic_enable,
+                    "training_actor_critic_enabled": actor_critic_enable,
                     "astrocyte_enabled": enable_astrocyte,
                     "surrogate_kind": surrogate_kind if reinf_enable else "none",
                     "input_probability": input_probability,
@@ -1166,7 +1634,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                     all_episode_diagnostics.append({
                         "seed": seed, "experiment_num": experiment_num,
                         "phase": verification_mode, "cycle": cycle_num,
-                        "condition": _condition_label(enable_stdp_during_training, reinf_enable),
+                        "condition": training_condition,
                         "baseline_mode": baseline_mode, "input_mode": input_mode,
                         "enable_stdp": verification_mode == "source_verification",
                         "enable_reinforce": reinf_enable and verification_mode == "frozen_evaluation",
@@ -1197,122 +1665,213 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                 "verify/goal_reached": verify_success,
                 "verify/elapsed_time": elapsed_time_verify,
             }
+            if actor_critic_enable:
+                metrics.update({
+                    "train/episode_return": training_episode_return,
+                    "train/mean_abs_td_error": train_diag["mean_abs_td_error"]
+                    if train_diag is not None else np.nan,
+                    "train/mean_actor_update_norm": train_diag["mean_actor_update_norm"]
+                    if train_diag is not None else np.nan,
+                    "train/critic_value_start": (
+                        train_diag["critic_value_start"] if train_diag is not None
+                        else float(td_critic.values[current_position].item())
+                        if td_critic is not None else np.nan
+                    ),
+                })
             logger.log_metrics(metrics, step=cycle_num)
 
             if diagnostics_enabled and cycle_num in evaluation_checkpoints and evaluation_rollouts > 0:
                 for astrocyte_mode in evaluation_astrocyte_modes:
-                    for rollout_idx in range(evaluation_rollouts):
-                        eval_seed = derive_seed(seed, 100_000 + cycle_num * 1000 + rollout_idx)
-                        eval_rngs = make_rng_streams(eval_seed)
-                        eval_diag = {}
-                        if reinf_enable:
-                            (eval_positions, eval_weights, eval_success,
-                             eval_elapsed, _eval_baseline) = setup_and_run_simulation_reinforce(
-                                NA=NA, weights_mask_XY=weights_mask_XY,
-                                weights_init_XY=weights_init_XY,
-                                weights_init_XI=weights_init_XI, n_steps=n_steps,
-                                current_position=current_position, goal=goal,
-                                learning_rate=learning_rate, wmin=wmin, wmax=wmax,
-                                weight_decay=weight_decay,
-                                post_spike_weight_decay=post_spike_weight_decay,
-                                reset=reset, refrac=refrac, thresh=thresh,
-                                intensity=intensity, time_steps=time_steps, dt=dt,
-                                enable_astrocyte=bool(astrocyte_mode), alpha=alpha, k=k,
-                                reinforce_lr=0.0, temperature=temperature,
-                                reward_goal=reward_goal, step_penalty=step_penalty,
-                                gamma=gamma, baseline_decay=baseline_decay,
-                                policy_mix_beta=policy_mix_beta, trace_decay=trace_decay,
-                                enable_stdp_during_training=False,
-                                surrogate_kind=surrogate_kind,
-                                surrogate_params=surrogate_params,
-                                running_baseline=running_baseline, diagnostics=eval_diag,
-                                input_refractory=input_refractory,
-                                input_probability=input_probability, input_mode=input_mode,
-                                sensory_generator=eval_rngs["sensory"],
-                                policy_generator=eval_rngs["action_torch"],
-                                decision_diagnostics=all_policy_diagnostics if diagnostics_enabled else None,
-                                baseline_mode=baseline_mode,
-                                stdp_selected_action_gain=stdp_selected_action_gain,
-                                apply_reinforce_update=False,
-                                **simulation_precompute_args,
-                                decision_metadata={
-                                    "seed": seed, "experiment_num": experiment_num,
-                                    "phase": "frozen_evaluation", "cycle": cycle_num,
-                                    "rollout": rollout_idx,
-                                    "astrocyte_enabled": bool(astrocyte_mode),
-                                    "input_probability": input_probability,
-                                    "input_mode": input_mode,
-                                    "input_refractory": input_refractory if input_refractory is not None else refrac,
-                                    "surrogate_kind": surrogate_kind,
-                                },
+                    policy_modes = (
+                        [("native_spike_softmax", "spike_softmax"),
+                         ("common_spike_argmax", "common_spike_argmax")]
+                        if actor_critic_enable else (
+                            [("native_reinforce_softmax", None),
+                             ("common_spike_argmax", None)]
+                            if reinf_enable else [("common_spike_argmax", None)]
+                        )
+                    )
+                    for evaluation_policy, td_policy_mode in policy_modes:
+                        for rollout_idx in range(evaluation_rollouts):
+                            eval_seed = derive_seed(
+                                seed, 100_000 + cycle_num * 1000 + rollout_idx,
                             )
-                        else:
-                            (eval_positions, eval_weights, eval_success,
-                             eval_elapsed) = setup_and_run_simulation(
-                                NA=NA, weights_mask_XY=weights_mask_XY,
-                                weights_init_XY=weights_init_XY,
-                                weights_init_XI=weights_init_XI, n_steps=n_steps,
-                                current_position=current_position, goal=goal,
-                                learning_rate=learning_rate, wmin=wmin, wmax=wmax,
-                                weight_decay=weight_decay,
-                                post_spike_weight_decay=post_spike_weight_decay,
-                                reset=reset, refrac=refrac, thresh=thresh,
-                                intensity=intensity, time_steps=time_steps, dt=dt,
-                                enable_astrocyte=bool(astrocyte_mode), alpha=alpha, k=k,
-                                enable_stdp=False, diagnostics=eval_diag,
-                                input_refractory=input_refractory,
-                                input_probability=input_probability, input_mode=input_mode,
-                                sensory_generator=eval_rngs["sensory"],
-                                policy_rng=eval_rngs["action_numpy"],
-                                baseline_mode=baseline_mode,
-                                stdp_selected_action_gain=stdp_selected_action_gain,
-                                apply_action_mask=False,
-                                **simulation_precompute_args,
-                            )
-                        all_evaluation_rollouts.append({
-                            "seed": seed, "experiment_num": experiment_num,
-                            "checkpoint_cycle": cycle_num,
-                            "rollout": rollout_idx,
-                            "condition": _condition_label(enable_stdp_during_training, reinf_enable),
-                            "baseline_mode": baseline_mode,
-                            "input_mode": input_mode,
-                            "enable_stdp": False,
-                            "enable_reinforce": reinf_enable,
-                            "apply_reinforce_update": False,
-                            "enforce_post_stdp_bounds": baseline_mode != "main_reference",
-                            "chosen_stdp_gain": stdp_selected_action_gain,
-                            "verification_mode": verification_mode,
-                            "training_stdp_enabled": enable_stdp_during_training,
-                            "training_reinforce_enabled": reinf_enable,
-                            "training_astrocyte_enabled": enable_astrocyte,
-                            "astrocyte_enabled": bool(astrocyte_mode),
-                            "success": int(eval_success),
-                            "route_length": len(eval_positions) - 1,
-                            "failure": int(not eval_success),
-                            "elapsed_seconds": eval_elapsed,
-                            "reward_return": eval_diag.get("reward_return", np.nan),
-                            "input_mode": input_mode,
-                            "weight_drift_norm": eval_diag.get("weight_drift_norm", np.nan),
-                            "fraction_weights_outside_bounds": eval_diag.get(
-                                "fraction_weights_outside_bounds", np.nan,
-                            ),
-                            "X_spikes": eval_diag.get("X_spikes", np.nan),
-                            "Y_spikes": eval_diag.get("Y_spikes", np.nan),
-                            "I_spikes": eval_diag.get("I_spikes", np.nan),
-                            "raw_input_events": eval_diag.get("raw_input_events", np.nan),
-                            "tie_frequency": eval_diag.get("tie_frequency", np.nan),
-                            "astro_active_fraction": eval_diag.get("astro_active_fraction", np.nan),
-                            "astro_mean_threshold_drop": eval_diag.get("astro_mean_threshold_drop", np.nan),
-                            "delta_w_stdp_norm": eval_diag.get("delta_w_stdp_norm", np.nan),
-                            "stdp_step_norm_sum": eval_diag.get("stdp_step_norm_sum", np.nan),
-                            "stdp_raw_update_l1": eval_diag.get("stdp_raw_update_l1", np.nan),
-                            "delta_w_rl_preclip_norm": eval_diag.get("delta_w_rl_preclip_norm", np.nan),
-                            "delta_w_rl_norm": eval_diag.get("delta_w_rl_norm", np.nan),
-                            "input_probability": input_probability,
-                            "input_refractory": input_refractory if input_refractory is not None else refrac,
-                        })
+                            eval_rngs = make_rng_streams(eval_seed)
+                            eval_diag = {}
+                            if actor_critic_enable:
+                                frozen_weights = weights_init_XY.detach().clone()
+                                frozen_critic = (
+                                    td_critic.values.detach().clone()
+                                    if td_critic is not None else None
+                                )
+                                (eval_positions, eval_weights, eval_success,
+                                 eval_elapsed, eval_return) = setup_and_run_simulation_td_rstdp(
+                                    NA=NA, weights_mask_XY=weights_mask_XY,
+                                    weights_init_XY=weights_init_XY,
+                                    weights_init_XI=weights_init_XI, n_steps=n_steps,
+                                    current_position=current_position, goal=goal,
+                                    learning_rate=learning_rate, wmin=wmin, wmax=wmax,
+                                    weight_decay=weight_decay,
+                                    post_spike_weight_decay=post_spike_weight_decay,
+                                    reset=reset, refrac=refrac, thresh=thresh,
+                                    intensity=intensity, time_steps=time_steps, dt=dt,
+                                    enable_astrocyte=bool(astrocyte_mode), alpha=alpha, k=k,
+                                    critic=td_critic,
+                                    actor_learning_rate=actor_learning_rate,
+                                    eligibility_tau_ms=eligibility_tau_ms,
+                                    temperature=actor_temperature,
+                                    reward_goal=reward_goal, step_penalty=step_penalty,
+                                    input_refractory=input_refractory,
+                                    input_probability=input_probability,
+                                    input_mode=input_mode,
+                                    sensory_generator=eval_rngs["sensory"],
+                                    policy_generator=eval_rngs["eval_action_torch"],
+                                    policy_rng=eval_rngs["eval_action_numpy"],
+                                    actor_weight_decay=actor_weight_decay,
+                                    actor_modulator=(
+                                        "reward" if actor_rule == "reward_rstdp"
+                                        else "td_error"
+                                    ),
+                                    gamma=actor_critic_gamma,
+                                    apply_actor_update=False,
+                                    apply_critic_update=False,
+                                    policy_mode=td_policy_mode,
+                                    diagnostics=eval_diag,
+                                    actor_step_diagnostics=all_actor_critic_steps,
+                                    decision_metadata={
+                                        "seed": seed, "experiment_num": experiment_num,
+                                        "phase": "frozen_evaluation", "cycle": cycle_num,
+                                        "rollout": rollout_idx,
+                                        "condition": training_condition,
+                                        "astrocyte_enabled": bool(astrocyte_mode),
+                                        "evaluation_policy": evaluation_policy,
+                                    },
+                                    **simulation_precompute_args,
+                                )
+                                if not np.array_equal(
+                                    eval_weights, frozen_weights.cpu().numpy(),
+                                ):
+                                    raise RuntimeError("Frozen TD-RSTDP evaluation changed actor weights")
+                                if td_critic is not None and not torch.equal(
+                                    td_critic.values, frozen_critic,
+                                ):
+                                    raise RuntimeError("Frozen TD-RSTDP evaluation changed critic values")
+                            elif reinf_enable and evaluation_policy == "native_reinforce_softmax":
+                                (eval_positions, eval_weights, eval_success,
+                                 eval_elapsed, _eval_baseline) = setup_and_run_simulation_reinforce(
+                                    NA=NA, weights_mask_XY=weights_mask_XY,
+                                    weights_init_XY=weights_init_XY,
+                                    weights_init_XI=weights_init_XI, n_steps=n_steps,
+                                    current_position=current_position, goal=goal,
+                                    learning_rate=learning_rate, wmin=wmin, wmax=wmax,
+                                    weight_decay=weight_decay,
+                                    post_spike_weight_decay=post_spike_weight_decay,
+                                    reset=reset, refrac=refrac, thresh=thresh,
+                                    intensity=intensity, time_steps=time_steps, dt=dt,
+                                    enable_astrocyte=bool(astrocyte_mode), alpha=alpha, k=k,
+                                    reinforce_lr=0.0, temperature=temperature,
+                                    reward_goal=reward_goal, step_penalty=step_penalty,
+                                    gamma=gamma, baseline_decay=baseline_decay,
+                                    policy_mix_beta=policy_mix_beta, trace_decay=trace_decay,
+                                    enable_stdp_during_training=False,
+                                    surrogate_kind=surrogate_kind,
+                                    surrogate_params=surrogate_params,
+                                    running_baseline=running_baseline, diagnostics=eval_diag,
+                                    input_refractory=input_refractory,
+                                    input_probability=input_probability, input_mode=input_mode,
+                                    sensory_generator=eval_rngs["sensory"],
+                                    policy_generator=eval_rngs["eval_action_torch"],
+                                    decision_diagnostics=all_policy_diagnostics,
+                                    baseline_mode=baseline_mode,
+                                    stdp_selected_action_gain=stdp_selected_action_gain,
+                                    apply_reinforce_update=False,
+                                    **simulation_precompute_args,
+                                    decision_metadata={
+                                        "seed": seed, "experiment_num": experiment_num,
+                                        "phase": "frozen_evaluation", "cycle": cycle_num,
+                                        "rollout": rollout_idx,
+                                        "astrocyte_enabled": bool(astrocyte_mode),
+                                    },
+                                )
+                            else:
+                                (eval_positions, eval_weights, eval_success,
+                                 eval_elapsed) = setup_and_run_simulation(
+                                    NA=NA, weights_mask_XY=weights_mask_XY,
+                                    weights_init_XY=weights_init_XY,
+                                    weights_init_XI=weights_init_XI, n_steps=n_steps,
+                                    current_position=current_position, goal=goal,
+                                    learning_rate=learning_rate, wmin=wmin, wmax=wmax,
+                                    weight_decay=weight_decay,
+                                    post_spike_weight_decay=post_spike_weight_decay,
+                                    reset=reset, refrac=refrac, thresh=thresh,
+                                    intensity=intensity, time_steps=time_steps, dt=dt,
+                                    enable_astrocyte=bool(astrocyte_mode), alpha=alpha, k=k,
+                                    enable_stdp=False, diagnostics=eval_diag,
+                                    input_refractory=input_refractory,
+                                    input_probability=input_probability, input_mode=input_mode,
+                                    sensory_generator=eval_rngs["sensory"],
+                                    policy_rng=eval_rngs["action_numpy"],
+                                    baseline_mode=baseline_mode,
+                                    stdp_selected_action_gain=stdp_selected_action_gain,
+                                    apply_action_mask=False,
+                                    **simulation_precompute_args,
+                                )
+                            all_evaluation_rollouts.append({
+                                "seed": seed, "experiment_num": experiment_num,
+                                "checkpoint_cycle": cycle_num,
+                                "rollout": rollout_idx,
+                                "condition": training_condition,
+                                "evaluation_policy": evaluation_policy,
+                                "baseline_mode": baseline_mode,
+                                "input_mode": input_mode,
+                                "enable_stdp": False,
+                                "enable_reinforce": reinf_enable,
+                                "enable_actor_critic": actor_critic_enable,
+                                "apply_reinforce_update": False,
+                                "apply_actor_update": False,
+                                "apply_critic_update": False,
+                                "enforce_post_stdp_bounds": baseline_mode != "main_reference",
+                                "chosen_stdp_gain": stdp_selected_action_gain,
+                                "verification_mode": verification_mode,
+                                "training_stdp_enabled": enable_stdp_during_training,
+                                "training_reinforce_enabled": reinf_enable,
+                                "training_actor_critic_enabled": actor_critic_enable,
+                                "training_astrocyte_enabled": enable_astrocyte,
+                                "astrocyte_enabled": bool(astrocyte_mode),
+                                "success": int(eval_success),
+                                "route_length": len(eval_positions) - 1,
+                                "failure": int(not eval_success),
+                                "elapsed_seconds": eval_elapsed,
+                                "reward_return": eval_return if actor_critic_enable else eval_diag.get("reward_return", np.nan),
+                                "weight_drift_norm": eval_diag.get("weight_drift_norm", np.nan),
+                                "fraction_weights_outside_bounds": eval_diag.get("fraction_weights_outside_bounds", np.nan),
+                                "X_spikes": eval_diag.get("X_spikes", np.nan),
+                                "Y_spikes": eval_diag.get("Y_spikes", np.nan),
+                                "I_spikes": eval_diag.get("I_spikes", np.nan),
+                                "raw_input_events": eval_diag.get("raw_input_events", np.nan),
+                                "tie_frequency": eval_diag.get("tie_frequency", np.nan),
+                                "astro_active_fraction": eval_diag.get("astro_active_fraction", np.nan),
+                                "astro_mean_threshold_drop": eval_diag.get("astro_mean_threshold_drop", np.nan),
+                                "delta_w_stdp_norm": eval_diag.get("delta_w_stdp_norm", np.nan),
+                                "stdp_step_norm_sum": eval_diag.get("stdp_step_norm_sum", np.nan),
+                                "stdp_raw_update_l1": eval_diag.get("stdp_raw_update_l1", np.nan),
+                                "delta_w_rl_preclip_norm": eval_diag.get("delta_w_rl_preclip_norm", np.nan),
+                                "delta_w_rl_norm": eval_diag.get("delta_w_rl_norm", np.nan),
+                                "mean_abs_td_error": eval_diag.get("mean_abs_td_error", np.nan),
+                                "mean_actor_update_norm": eval_diag.get("mean_actor_update_norm", np.nan),
+                                "input_probability": input_probability,
+                                "input_refractory": input_refractory if input_refractory is not None else refrac,
+                            })
 
         results_dir = str(logger.active_exp_dir)
+        if (
+            td_critic is not None
+            and bool(actor_critic_cfg.get("save_critic_values", False))
+        ):
+            td_critic.save(
+                results_dir, grid_size=N,
+                make_heatmap=bool(actor_critic_cfg.get("save_critic_heatmap", True)),
+            )
 
         weights_filename = os.path.join(results_dir, "weight_matrices.txt")
         with open(weights_filename, 'w') as f:
@@ -1365,6 +1924,7 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
         _write_rows(diag_dir / "raw_per_seed.csv", all_episode_diagnostics)
         _write_rows(diag_dir / "evaluation_rollouts.csv", all_evaluation_rollouts)
         _write_rows(diag_dir / "policy_diagnostics.csv", all_policy_diagnostics)
+        _write_rows(diag_dir / "actor_critic_steps.csv", all_actor_critic_steps)
         _write_rows(
             diag_dir / "summary_statistics.csv",
             _build_run_summaries(all_episode_diagnostics, all_evaluation_rollouts,
@@ -1384,6 +1944,13 @@ def run_experiment(config: dict, logger: ExperimentLogger = None):
                 "rollouts_per_checkpoint_mode": evaluation_rollouts,
                 "checkpoints": sorted(evaluation_checkpoints),
                 "astrocyte_modes": evaluation_astrocyte_modes,
+                "policy_modes": (
+                    ["native_spike_softmax", "common_spike_argmax"]
+                    if actor_critic_enable else (
+                        ["native_reinforce_softmax", "common_spike_argmax"]
+                        if reinf_enable else ["common_spike_argmax"]
+                    )
+                ),
                 "stdp": False, "reinforce_lr": 0.0,
             },
         }, indent=2, default=str))

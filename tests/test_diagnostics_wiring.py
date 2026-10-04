@@ -83,8 +83,11 @@ def test_short_training_run_writes_real_training_and_frozen_diagnostics(tmp_path
 
     with (diagnostic_dir / "evaluation_rollouts.csv").open(newline="") as stream:
         evaluation_rows = list(csv.DictReader(stream))
-    assert len(evaluation_rows) == 2
+    assert len(evaluation_rows) == 4
     assert {row["astrocyte_enabled"] for row in evaluation_rows} == {"False", "True"}
+    assert {row["evaluation_policy"] for row in evaluation_rows} == {
+        "native_reinforce_softmax", "common_spike_argmax",
+    }
     assert all(float(row["weight_drift_norm"]) == 0 for row in evaluation_rows)
     assert all(float(row["fraction_weights_outside_bounds"]) == 0 for row in evaluation_rows)
     assert all(int(row["X_spikes"]) > 0 for row in evaluation_rows)

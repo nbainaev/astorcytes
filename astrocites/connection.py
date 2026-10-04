@@ -11,6 +11,7 @@ class Connection(torch.nn.Module):
                  diagonal_connection=False, enforce_post_stdp_bounds=True,
                  apply_structural_mask_during_stdp=True,
                  clamp_initial_weights=True,
+                 enable_rstdp_state=False,
                  baseline_decay=0.01, policy_mix_beta=0.5,
                  gamma=0.99, trace_decay=0.95, temperature=1.0, **kwargs):
         super().__init__()
@@ -33,6 +34,10 @@ class Connection(torch.nn.Module):
             ):
                 w = torch.clamp(w, self.wmin, self.wmax)
         self.w = torch.nn.Parameter(w, False)
+        self.rstdp_enabled = bool(enable_rstdp_state)
+        if self.rstdp_enabled:
+            self.register_buffer("rstdp_drive", torch.zeros_like(self.w))
+            self.register_buffer("rstdp_eligibility", torch.zeros_like(self.w))
         self.update_rule = update_rule(self, nu=nu, weight_decay=weight_decay,
                                         post_spike_weight_decay=post_spike_weight_decay)
         self.impulse_amplitude = impulse_amplitude
@@ -111,6 +116,33 @@ class Connection(torch.nn.Module):
         """Accumulate discounted episode return independently of eligibility."""
         self.reward_accumulator += self.discount * step_reward
         self.discount *= self.gamma
+
+    @torch.no_grad()
+    def update_rstdp_eligibility(self, decay):
+        """Move this action window's local STDP drive into its eligibility trace."""
+        if not self.rstdp_enabled:
+            raise RuntimeError("R-STDP state was not enabled for this connection")
+        self.rstdp_eligibility.mul_(float(decay)).add_(self.rstdp_drive)
+        self.rstdp_drive.zero_()
+
+    @torch.no_grad()
+    def apply_rstdp_update(self, td_error, learning_rate, mask=None,
+                           actor_weight_decay=0.0):
+        """Apply TD-modulated eligibility without touching REINFORCE state."""
+        if not self.rstdp_enabled:
+            raise RuntimeError("R-STDP state was not enabled for this connection")
+        actor_weight_decay = float(actor_weight_decay)
+        if not 0.0 <= actor_weight_decay < 1.0:
+            raise ValueError("actor_weight_decay must be in [0, 1)")
+        if actor_weight_decay:
+            self.w.mul_(1.0 - actor_weight_decay)
+        requested_delta = float(learning_rate) * float(td_error) * self.rstdp_eligibility
+        before = self.w.clone()
+        self.w.add_(requested_delta)
+        self.w.clamp_(self.wmin, self.wmax)
+        if mask is not None:
+            self.w.mul_(mask)
+        return self.w - before, requested_delta
 
     def accumulate_trace(self, s_idx, adj_positions, grad_slice, step_reward=None):
         """Accumulate one step of the REINFORCE eligibility trace.
