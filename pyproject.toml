@@ -1,0 +1,61 @@
+[project]
+name = "astro-article"
+version = "0.1.0"
+description = "Spiking predictive navigation with astrocyte memory: models and article experiments"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "numpy==2.2.6",
+  "torch==2.12.0",
+  "scipy==1.15.3", # BLAS support for Numba linear algebra.
+  "pandas==2.3.3",
+  "matplotlib==3.10.9",
+  "numba==0.68.0",
+  "pillow==12.2.0",
+]
+
+[project.scripts]
+astro-experiments = "experiments.__main__:main"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/astrorl", "experiments"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"configs" = "experiments/configs"
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+# Numerical and plotting dependencies.
+constraint-dependencies = [
+  "llvmlite==0.50.0",
+  "sympy==1.14.0",
+  "networkx==3.4.2",
+  "filelock==3.29.0",
+  "fsspec==2026.4.0",
+  "typing-extensions==4.15.0",
+  "mpmath==1.3.0",
+  "jinja2==3.1.6",
+  "markupsafe==3.0.3",
+  "packaging==26.2",
+  "python-dateutil==2.9.0.post0",
+  "pytz==2026.2",
+  "tzdata==2026.2",
+  "contourpy==1.3.2",
+  "cycler==0.12.1",
+  "fonttools==4.63.0",
+  "kiwisolver==1.5.0",
+  "pyparsing==3.3.2",
+  "six==1.17.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -1,0 +1,121 @@
+{
+  "training_episodes": 600,
+  "max_steps": 50,
+  "termination": "first goal arrival or 50 actions in both groups",
+  "reward": "1 on goal arrival minus 0.01 per attempted action; collision penalty 0",
+  "starts": "IID uniform non-goal free cells; paired across all groups/models for each seed",
+  "goal": "fixed lexicographically maximum free cell, identical for all conditions",
+  "models": [
+    "mlp",
+    "random",
+    "noastro",
+    "astro",
+    "trace"
+  ],
+  "groups": [
+    "no_rl",
+    "rl"
+  ],
+  "maps": [
+    "open13_152010",
+    "obstacles7_152011",
+    "rooms9_152012",
+    "branching7_152013"
+  ],
+  "workers": 30,
+  "blas_threads_per_worker": 1,
+  "final_seeds": [
+    62000,
+    62001,
+    62002,
+    62003,
+    62004,
+    62005,
+    62006,
+    62007,
+    62008,
+    62009
+  ],
+  "final_runs": 400,
+  "evaluation_episodes_per_mode": 100,
+  "evaluation_modes": {
+    "astro": [
+      "memory_on",
+      "memory_off"
+    ],
+    "trace": [
+      "memory_on",
+      "memory_off"
+    ],
+    "others": [
+      "memory_absent"
+    ]
+  },
+  "evaluation": "fresh starts/actions, frozen learned weights; within-episode memory writes allowed only when on; reset all dynamic state each episode",
+  "memory_ablation": "same trained checkpoint, matched evaluation starts and action uniforms; only memory influence disabled",
+  "no_rl": "prediction learns; actor weights and actor optimizer frozen; no reward or entropy update; policy temperature fixed",
+  "random_walk": "uniform over four attempted cardinal actions, including blocked directions; Bellec predictor learns, no actor in either group",
+  "mlp": "2-64-64-4 local-DFA policy; independent 6-64-64-24 local-DFA next-input predictor",
+  "snn": "identical Bellec ALIF/prediction architecture and four direct Motor LIFs for No Astro, AstroRL and Trace; detached RL head",
+  "initialization": "zero readout weights give uniform initial policy for every model; same SNN initialization within a seed",
+  "prediction_probe": "512 forced-random transitions in 128 four-transition contexts; shared inputs, disjoint split; offline diagnostic, no extra training or on-policy evaluation episodes",
+  "prediction_targets": "single MSE between predicted next 24-channel RSNN input code and actual next input code; identical code is written to memory; no auxiliary targets",
+  "tuning": {
+    "screen": {
+      "candidates": 18,
+      "seeds": [
+        61000,
+        61001
+      ],
+      "episodes": 200
+    },
+    "confirm": {
+      "candidates": 4,
+      "seeds": [
+        61100,
+        61101,
+        61102
+      ],
+      "episodes": 600
+    },
+    "validation": {
+      "candidates": 2,
+      "seeds": [
+        61200,
+        61201,
+        61202,
+        61203,
+        61204
+      ],
+      "episodes": 600
+    },
+    "selection": "independent per group/model/map; maximize mean objective minus 0.25 between-seed sample SD; final seed results never tune or select checkpoints",
+    "no_rl_objective": ".4 coverage AUC padded flat to horizon50 + .2 novelty/action + .4 common-probe balanced prediction accuracy",
+    "rl_objective": ".5 minmax reward + .3 optimal/actual steps + .2 common-probe balanced prediction accuracy",
+    "random_objective": "no-RL objective in both groups; reward cannot train a random walk"
+  },
+  "metrics": {
+    "reward01": "mean across episodes of (R + .5)/(1.5 - .01*d_star), R=success-.01*T",
+    "optimal_over_steps": "d_star/T; failures at horizon remain marked as failures/censored",
+    "path_efficiency": "success*d_star/T, accompanying raw ratio to expose failure-related optimism",
+    "coverage": "visited cells including start / all free cells",
+    "coverage_auc_50": "coverage curve extended flat, without invented transitions, from early terminal to step50",
+    "backtracking": "immediate reversal / successful moves; per-action alternative retained",
+    "occupancy": "source-cell count per actual attempted action; normalize within seed then average seeds; walls masked, shared map-specific color scale",
+    "prediction": "pre-update input-code MSE/RMSE; diagnostic cell accuracy from nearest fixed code in evaluator only; move/collision strata and shared-input probe"
+  },
+  "uncertainty": "95% nonparametric bootstrap over 10 independent seeds; paired bootstrap/sign-flip for paired comparisons; Holm within prespecified metric families",
+  "limitations": [
+    "fixed four maps are training tasks, not unseen-map generalization",
+    "early stopping makes realized transition budgets unequal despite equal episode caps; plot both episode and transition axes",
+    "independent hyperparameter tuning estimates optimized algorithm performance; between-group/model contrasts do not isolate one mechanism",
+    "within-checkpoint memory ablation isolates inference influence, not effects of memory on training history",
+    "on-policy prediction error depends on visited states; shared-input probes provide common evaluation",
+    "MLP and SNN capacities/learning rules differ; report parameter and optimizer budgets",
+    "No Astro and random walk without RL have equal uniform behavior; predictors can differ if independently tuned"
+  ],
+  "data_retention": "compact tuning summaries, failures, configs and seeds retained; own tuning raw folders removed after durable commit; final scalar histories, occupancy and checkpoint retained",
+  "figures": "general publication style at 180 mm; PDF/SVG and 600 dpi PNG; journal-specific requirements pending",
+  "memory_input": "same continuous fixed projection used by RSNN, before spike generation; 24 channels; no RBF or sparsification",
+  "prediction_objective": "mean((prediction-next_input)**2), averaged over samples and 24 channels"
+}

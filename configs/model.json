@@ -1,0 +1,17 @@
+{
+  "obs_dim": 2,
+  "n_actions": 4,
+  "neurons": 100,
+  "input_channels": 24,
+  "rsnn_steps": 128,
+  "input_action_gain": 0.0,
+  "input_probability_scale": 1.0,
+  "predictor_hidden": 128,
+  "predictor_scale": 1.0,
+  "bellec_options": {
+    "input_scale": 0.05,
+    "recurrent_scale": 0.1,
+    "tau_out_ms": 40.0,
+    "input_bias": true
+  }
+}

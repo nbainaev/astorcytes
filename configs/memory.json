@@ -1,0 +1,42 @@
+{
+  "astro": {
+    "astro": {
+      "amplitude": 0.73,
+      "gthr": 0.2,
+      "tau": 0.6,
+      "threshold": 0.03
+    },
+    "duration": 1.0,
+    "gate": {
+      "contrast": 0.2,
+      "gain": 1.0,
+      "minimum": 0.03,
+      "mode": "relative",
+      "temperature": 0.03
+    },
+    "trace": {
+      "gain": 2.0,
+      "tau": 32.0
+    }
+  },
+  "trace": {
+    "astro": {
+      "amplitude": 0.73,
+      "gthr": 0.2,
+      "tau": 1.2,
+      "threshold": 0.03
+    },
+    "duration": 1.0,
+    "gate": {
+      "contrast": 0.2,
+      "gain": 2.0,
+      "minimum": 0.03,
+      "mode": "relative",
+      "temperature": 0.03
+    },
+    "trace": {
+      "gain": 2.0,
+      "tau": 8.0
+    }
+  }
+}

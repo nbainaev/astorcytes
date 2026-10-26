@@ -1,0 +1,104 @@
+{
+  "motor": {
+    "lr": 0.006,
+    "lr_end": 0.0006000000000000001,
+    "entropy": 0.03,
+    "entropy_end": 0.0001,
+    "anneal_fraction": 0.6666666666666666,
+    "bias": 1.45,
+    "amplitude": 1.0,
+    "temperature": 0.03,
+    "temperature_end": 0.003,
+    "inhibition_scale": 0.25
+  },
+  "motor_by_map": {
+    "open13_152010": {
+      "lr": 0.006,
+      "lr_end": 0.0006000000000000001,
+      "entropy": 0.03,
+      "entropy_end": 0.0001,
+      "anneal_fraction": 0.6666666666666666,
+      "bias": 1.45,
+      "amplitude": 1.0,
+      "temperature": 0.03,
+      "temperature_end": 0.003,
+      "inhibition_scale": 0.25
+    },
+    "obstacles7_152011": {
+      "lr": 0.006,
+      "lr_end": 0.0006000000000000001,
+      "entropy": 0.03,
+      "entropy_end": 0.0001,
+      "anneal_fraction": 0.6666666666666666,
+      "bias": 1.45,
+      "amplitude": 1.0,
+      "temperature": 0.03,
+      "temperature_end": 0.0075,
+      "inhibition_scale": 0.25
+    },
+    "rooms9_152012": {
+      "lr": 0.006,
+      "lr_end": 0.0006000000000000001,
+      "entropy": 0.03,
+      "entropy_end": 0.0001,
+      "anneal_fraction": 0.6666666666666666,
+      "bias": 1.45,
+      "amplitude": 1.0,
+      "temperature": 0.03,
+      "temperature_end": 0.0075,
+      "inhibition_scale": 0.25
+    },
+    "branching7_152013": {
+      "lr": 0.003,
+      "lr_end": 0.00030000000000000003,
+      "entropy": 0.03,
+      "entropy_end": 0.0001,
+      "anneal_fraction": 0.6666666666666666,
+      "bias": 1.45,
+      "amplitude": 1.0,
+      "temperature": 0.03,
+      "temperature_end": 0.003,
+      "inhibition_scale": 0.25
+    }
+  },
+  "prediction": {
+    "prediction_lr": 0.001,
+    "core_lr": 0.0003,
+    "core_step_cap": 5e-05,
+    "prediction_epochs": 16,
+    "prediction_scale": 50.0
+  },
+  "stages": [
+    {
+      "name": "screen",
+      "episodes": 200,
+      "seeds": [
+        61000,
+        61001
+      ],
+      "keep": 4
+    },
+    {
+      "name": "confirm",
+      "episodes": 600,
+      "seeds": [
+        61100,
+        61101,
+        61102
+      ],
+      "keep": 2
+    },
+    {
+      "name": "validation",
+      "episodes": 600,
+      "seeds": [
+        61200,
+        61201,
+        61202,
+        61203,
+        61204
+      ],
+      "keep": 1
+    }
+  ]
+}
